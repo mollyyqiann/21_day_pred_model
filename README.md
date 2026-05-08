@@ -81,22 +81,30 @@ Full investigation, ablations, and honest assessment in [REPORT.md](REPORT.md).
     └── multi_horizon.json
 ```
 
-## Using a trained model
+## Using a trained model on new data
 
-The `.joblib` file is a `CalibratedClassifierCV` wrapping a `GradientBoostingClassifier`. Given a feature matrix in the right column order:
+Each `.joblib` file is a **dict** (not a model directly) bundling the calibrator, raw GBC, feature order, and training-set medians for imputation:
 
 ```python
-import joblib
-import pandas as pd
+import joblib, pandas as pd
 
-model = joblib.load("models/monthly_gainer_v3_combined.joblib")
-# model.feature_names_in_ holds the expected feature order
+bundle = joblib.load("models/monthly_gainer_v3_combined.joblib")
+feats = bundle["feats"]                     # 37 feature names in model order
+medians = bundle["impute_medians"]          # defaults for missing values
 
-X = pd.read_csv("your_features.csv")[model.feature_names_in_]
-prob = model.predict_proba(X)[:, 1]   # P(touch +30% within 21 trading days)
+X = pd.read_csv("your_features.csv")
+for col in feats:
+    if col not in X.columns:
+        X[col] = medians[col]               # add any missing column
+X = X[feats].fillna(value=medians)
+
+prob = bundle["calibrator"].predict_proba(X)[:, 1]
+# prob[i] = calibrated P(ticker_i touches +30% within next 21 trading days)
 ```
 
-To reproduce features end-to-end you also need the upstream daily price/volume panel (`burst_panel_v8`-shaped: OHLCV + the 16 base features per ticker-day) plus FinBERT-scored news. Those upstream feeds are not in this repo — building them is its own pipeline.
+**Want to score new data without rebuilding the upstream pipeline?**
+- See [data_schema.md](data_schema.md) for the exact 37 features, dtypes, formulas, and what raw data each one needs.
+- Run [`code/score_new_data.py`](code/score_new_data.py) for a self-contained end-to-end example: pulls yfinance + ^VIX, computes all 37 features (catalyst defaulted to zeros), and prints today's top picks across an example 50-ticker universe. Just `pip install yfinance pandas numpy scikit-learn joblib` and run.
 
 ## Training from scratch
 
