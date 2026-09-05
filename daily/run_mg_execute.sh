@@ -49,8 +49,9 @@ if [ "${CAL_BAD:-0}" = "1" ]; then
     log "not a trading day -> skip ($CAL)"
     exit 0
   fi
+else
+  log "calendar ok ($CAL)"
 fi
-log "calendar ok ($CAL)"
 
 PLAN="$ROOT/output/monthly_gainer/trade_plans/latest.json"
 TODAY=$(date +%F)
