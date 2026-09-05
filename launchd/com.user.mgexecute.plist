@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.mgexecute</string>
+
+    <!--
+        Monthly Gainer v3 - 15:55 ET order executor. The partner of
+        com.user.mgcloseplan (15:45), which scores and writes the plan but
+        deliberately places nothing.
+
+        This runs daily/run_mg_execute.sh, which feeds
+        output/monthly_gainer/trade_plans/latest.json to a headless Claude Code
+        session. That session submits the plan's orders through the Robinhood
+        MCP connector into the dedicated Agentic account (resolved at run
+        time from config/mg_execution.json via code/mg_account.py), runs
+        124_mg_reconcile.py against the resulting live positions, and Telegrams
+        an execution receipt.
+
+        THIS ONE PLACES REAL ORDERS. Set MG_EXEC_MODE=dry in the wrapper (or
+        unload this job) to stop that.
+
+        Ten minutes after 15:45 is not arbitrary: 123_mg_close_scorer.py
+        measured a 15:55 fill at -0.04% vs the official close (sd 0.39%)
+        against +0.70% (sd 3.47%) for the next open. The window closes at
+        16:00 -- dollar-based fractional orders are regular-hours only -- so
+        this job must not be moved later.
+
+        Hour is the ET clock value: this Mac's launchd is pinned to ET.
+    -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>/bin/bash</string>
+        <string>/Users/mollyqian/stocks/daily/run_mg_execute.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key><integer>1</integer>
+            <key>Hour</key><integer>15</integer>
+            <key>Minute</key><integer>55</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>2</integer>
+            <key>Hour</key><integer>15</integer>
+            <key>Minute</key><integer>55</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>3</integer>
+            <key>Hour</key><integer>15</integer>
+            <key>Minute</key><integer>55</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>4</integer>
+            <key>Hour</key><integer>15</integer>
+            <key>Minute</key><integer>55</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>5</integer>
+            <key>Hour</key><integer>15</integer>
+            <key>Minute</key><integer>55</integer>
+        </dict>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mollyqian/stocks</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mollyqian/stocks/output/monthly_gainer/execute.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/mollyqian/stocks/output/monthly_gainer/execute.stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

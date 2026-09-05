@@ -1,5 +1,14 @@
 # Performance Review & Validated Improvements
 
+> **Superseded (2026-08).** The 21-day-gainer section below — "hits its number",
+> "top-5 picks hit 58%" — did not survive a later revalidation that corrected for
+> survivorship and look-ahead bias. See the status section at the top of
+> [README.md](README.md). This document is kept as a record of what was believed
+> in June 2026, including the useful part: that validation overturned two of
+> three first instincts. The burst and drop findings have not been re-examined
+> under the same controls and should be read with the same suspicion.
+
+
 A backtested reflection on the three models' live predictions, and improvement
 proposals that were **validated before any change** — notably, two of three
 first-instinct fixes were overturned by the backtest.

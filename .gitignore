@@ -26,3 +26,9 @@ Thumbs.db
 data/
 output/
 *.log
+
+# Local secrets and account config. Only *.example.json is tracked --
+# config/burst_daily.json holds Telegram bot tokens and
+# config/mg_execution.json holds the live brokerage account number.
+config/*.json
+!config/*.example.json
