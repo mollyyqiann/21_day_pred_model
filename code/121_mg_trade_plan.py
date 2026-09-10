@@ -36,10 +36,16 @@ peaking around day 14, and they give back ~10.4pp from peak to close. Capping
 near the median peak raised total P&L in BOTH model eras; +20% and +30% caps
 were negative in era B. This is about capital turnover, not win rate.
 
+SUPERSEDED FOR LIVE USE (2026-09). The scheduled path is
+123_mg_close_scorer.py (15:45, TAKE_PROFIT 0.30) plus 124_mg_reconcile.py.
+This file is kept for its v1 rule set and analysis; it now READS
+data/mg_paper_positions.json without writing it, so running it can no longer
+disturb live positions. --confirm / --close still write, deliberately.
+
 Usage:
-    python 121_mg_trade_plan.py            # print today's plan
+    python 121_mg_trade_plan.py            # print today's plan (read-only)
     python 121_mg_trade_plan.py --json     # machine-readable
-State: data/mg_paper_positions.json  (positions you tell it you opened)
+State: data/mg_paper_positions.json  (owned by 123/124; read-only from here)
 """
 import sys, json, argparse
 from datetime import datetime
@@ -90,6 +96,7 @@ def build_plan(score_csv=None):
     st = load_state()
     open_pos = {p["ticker"]: p for p in st["positions"]}
     ever = set(st["ever_entered"])
+    close_by_ticker = dict(zip(d["ticker"], d["close"]))
 
     exits = []
     for t, p in open_pos.items():
@@ -97,10 +104,22 @@ def build_plan(score_csv=None):
         miss = int(p.get("days_out_of_top15", 0)) + (0 if t in top15 else 1)
         if t in top15: miss = 0
         why = None
-        if held >= MAX_HOLD_DAYS: why = f"21-day cap reached"
+        entry_price = p.get("entry_price")
+        current_price = close_by_ticker.get(t)
+        ret = ((current_price / entry_price) - 1
+               if entry_price and current_price else None)
+        # 2026-09-09: TAKE_PROFIT was defined and printed in the footer as an
+        # enforced rule, but never actually checked here -- LITE sat at
+        # +15.65% (past the +12% target) with no exit flagged until this was
+        # added. Take-profit checked first since it can fire on day 1,
+        # before the MIN_HOLD_DAYS gate below applies to the other rules.
+        if ret is not None and ret >= TAKE_PROFIT:
+            why = f"take-profit: {ret:+.1%} >= {TAKE_PROFIT:+.0%}"
+        elif held >= MAX_HOLD_DAYS: why = f"21-day cap reached"
         elif held > MIN_HOLD_DAYS and miss >= DROPOUT_DAYS: why = f"out of top-15 for {miss} days"
         if why: exits.append({"ticker": t, "reason": why, "days_held": held,
-                              "entry_price": p.get("entry_price")})
+                              "entry_price": entry_price, "current_price": current_price,
+                              "return_pct": ret})
         p["days_held"] = held; p["days_out_of_top15"] = miss
 
     free = SLOTS - (len(open_pos) - len(exits))
@@ -188,4 +207,8 @@ if __name__ == "__main__":
         stamp = datetime.now().strftime("%Y-%m-%d")
         (pdir / f"plan_{stamp}.txt").write_text(txt)
         (pdir / "latest.txt").write_text(txt)
-        save_state(plan["state"])
+        # DO NOT save_state() here. 123_mg_close_scorer.py and
+        # 124_mg_reconcile.py own data/mg_paper_positions.json now, and this
+        # script's rules differ from theirs (TAKE_PROFIT 0.12 vs 0.30). A plain
+        # run of this file used to advance days_held under the live strategy's
+        # feet, aging real positions toward the 21-day cap. Read-only now.

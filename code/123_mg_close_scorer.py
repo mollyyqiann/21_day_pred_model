@@ -114,15 +114,48 @@ def build():
     openp = {p["ticker"]: p for p in st["positions"]}
     ever = set(st["ever_entered"])
 
-    exits = []
+    # Same-session prices for the held names. This is the take-profit input:
+    # without it TAKE_PROFIT was a printed footer with no code behind it, and
+    # since the model re-picks its own holdings (they stay in the top-15, so
+    # the dropout rule never fires either) the only reachable exit was the
+    # 21-day cap. Positions could only ever accumulate.
+    prices = dict(zip(d.ticker, d.close))
+    today = datetime.now().date().isoformat()
+
+    exits, warnings = [], []
     for t, p in openp.items():
-        held = int(p.get("days_held", 0)) + 1
-        miss = 0 if t in top15 else int(p.get("days_out_of_top15", 0)) + 1
+        # Day counting must be idempotent. build() used to increment on every
+        # invocation, so a manual run -- or the 12:49 executor retry on
+        # 2026-09-09 -- silently aged every position by an extra day and would
+        # have tripped the 21-day cap at roughly day 10.
+        if p.get("last_counted") != today:
+            p["miss_base"] = int(p.get("days_out_of_top15", 0))
+            p["days_held"] = int(p.get("days_held", 0)) + 1
+        held = int(p.get("days_held", 0))
+        miss = 0 if t in top15 else int(p.get("miss_base", 0)) + 1
+
+        px, entry = prices.get(t), p.get("entry_price")
+        gain = (float(px) / float(entry) - 1.0) if px is not None and entry else None
+        if gain is None:
+            # A held name absent from the score file cannot be price-checked,
+            # so its take-profit silently stops working. Say so out loud.
+            warnings.append(f"{t}: no price in today's score file — take-profit NOT evaluated")
+
         why = None
-        if held >= MAX_HOLD_DAYS: why = "21-day cap"
-        elif held > MIN_HOLD_DAYS and miss >= DROPOUT_DAYS: why = f"out of top-15 for {miss}d"
-        if why: exits.append({"ticker": t, "reason": why, "days_held": held})
-        p["days_held"], p["days_out_of_top15"] = held, miss
+        if gain is not None and gain >= TAKE_PROFIT:
+            # Take profit outranks everything and ignores MIN_HOLD_DAYS: the
+            # target is hit, the reason to hold is gone.
+            why = f"take profit {gain*100:+.1f}%"
+        elif held >= MAX_HOLD_DAYS:
+            why = "21-day cap"
+        elif held > MIN_HOLD_DAYS and miss >= DROPOUT_DAYS:
+            why = f"out of top-15 for {miss}d"
+        if why:
+            exits.append({"ticker": t, "reason": why, "days_held": held,
+                          "gain": round(gain, 4) if gain is not None else None})
+
+        p["days_out_of_top15"] = miss
+        p["last_counted"] = today
 
     free = SLOTS - (len(openp) - len(exits))
     entries, watch = [], []
@@ -134,7 +167,8 @@ def build():
             entries.append(r)
     entries = entries[:max(0, free)]
     return {"asof": asof, "exits": exits, "entries": entries, "watch": watch,
-            "free": free, "open": len(openp), "state": st}
+            "free": free, "open": len(openp), "state": st,
+            "warnings": warnings, "prices": prices}
 
 
 def render(p):
@@ -152,6 +186,8 @@ def render(p):
                  + ("  [HELD]" if w["held"] else ""))
     L += ["", f"SELL ({len(p['exits'])}):"]
     L += [f"  - {e['ticker']:<6} {e['reason']} (held {e['days_held']}d)" for e in p["exits"]] or ["  (none)"]
+    if p.get("warnings"):
+        L += [""] + [f"  !! {w}" for w in p["warnings"]]
     L += ["", f"BUY ({len(p['entries'])}):"]
     if p["entries"]:
         for e in p["entries"]:
@@ -215,7 +251,9 @@ if __name__ == "__main__":
         "free_after_exits": plan["free"],
         "slot_dollars": SLOT_DOLLARS,
         "sells": [{"ticker": e["ticker"], "reason": e["reason"],
-                   "days_held": e["days_held"]} for e in plan["exits"]],
+                   "days_held": e["days_held"], "gain": e.get("gain")}
+                  for e in plan["exits"]],
+        "warnings": plan.get("warnings", []),
         "buys": [{"ticker": e["ticker"], "dollar_amount": SLOT_DOLLARS,
                   "last": round(float(e["close"]), 2),
                   "raw_margin": round(float(e["raw_margin"]), 4)}
