@@ -31,8 +31,10 @@ RULES ENCODED
 -------------
 ENTRY  top-5 by raw_margin, first appearance of that ticker only,
        extension indicator FAVOURABLE (0 of 3 flags), free slot.
-EXIT   take profit +12%; or out of top-15 for 2 consecutive publication days
-       (minimum 2-day hold); or 21 trading days.
+EXIT   take profit +12%; or stop loss -15%; or out of top-15 for 2
+       consecutive publication days (minimum 2-day hold); or 21 trading days.
+       TP and SL are checked once daily at 15:45 against the same-session
+       price and are exempt from the minimum hold.
 SIZE   8 slots, equal weight, fractional (dollar) orders -- regular hours only.
 
 TP is +12% as of 2026-09-09 (previously +30%). Read the note above TAKE_PROFIT
@@ -81,6 +83,23 @@ SLOT_DOLLARS = 125
 # one is has not been settled. It is a single number: override it with
 # MG_TAKE_PROFIT=0.30 without editing this file, or change the default here.
 TAKE_PROFIT = float(os.environ.get("MG_TAKE_PROFIT") or 0.12)
+
+# Stop loss, added 2026-09-10. Before this the strategy had NO adverse-move
+# exit at all: the dropout rule is structurally unreachable (raw_margin is a
+# volatility sort with dd_60d corr -0.71, so a position that falls hard ranks
+# HIGHER and re-entrenches in the top-15 -- 13 of today's top-15 are >25%
+# below their 60-day high), which left "went up 12%" and "21 days passed" as
+# the only ways out. A position could halve and simply sit there.
+#
+# -15% is sized from the book itself, not backtested: the top-15's median
+# daily ATR is 5.3% (twice the SP500 median), so -15% = 2.8x ATR -- inside the
+# classic 2-4x band; anything under ~2x (-8%, -10%) is daily noise for these
+# names. Two honest caveats: (1) UNBACKTESTED -- several MG rules reversed
+# under proper controls, this one has not been tested at all; (2) it is
+# evaluated once a day at 15:45 against the same-session price, so a gap
+# through the level exits at the 15:55 price, not at -15%.
+# Override with MG_STOP_LOSS (e.g. 0.12); 0 disables it.
+STOP_LOSS = float(os.environ.get("MG_STOP_LOSS") or 0.15)
 MAX_HOLD_DAYS = 21
 DROPOUT_DAYS = 2
 MIN_HOLD_DAYS = 2
@@ -162,6 +181,12 @@ def build():
             # Take profit outranks everything and ignores MIN_HOLD_DAYS: the
             # target is hit, the reason to hold is gone.
             why = f"take profit {gain*100:+.1f}%"
+        elif STOP_LOSS and gain is not None and gain <= -STOP_LOSS:
+            # Stop loss: same priority logic as the take profit and likewise
+            # exempt from MIN_HOLD_DAYS -- a day-1 crash is exactly the case
+            # it exists for. The dropout rule cannot do this job (see the
+            # STOP_LOSS note above): falling RAISES a name's rank here.
+            why = f"stop loss {gain*100:+.1f}%"
         elif held >= MAX_HOLD_DAYS:
             why = "21-day cap"
         elif held > MIN_HOLD_DAYS and miss >= DROPOUT_DAYS:
@@ -212,6 +237,7 @@ def render(p):
     else:
         L.append("  (none — no FAVOURABLE first-time names, or no free slot)")
     L += ["", f"Standing exits: +{TAKE_PROFIT*100:.0f}% take profit | "
+              f"-{STOP_LOSS*100:.0f}% stop loss | "
               f"2 days out of top-15 | {MAX_HOLD_DAYS}-day cap",
           f"Executor fires at {FILL_WINDOW} and sends its own receipt.",
           "To stop it:  launchctl unload ~/Library/LaunchAgents/com.user.mgexecute.plist"]
