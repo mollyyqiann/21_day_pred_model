@@ -305,5 +305,21 @@ if __name__ == "__main__":
     (PLANS / f"closeplan_{stamp}.json").write_text(body)
     (PLANS / "latest.json").write_text(body)
     STATE.write_text(json.dumps(plan["state"], indent=2, default=str))
+    # Shadow ledger: exit-rule B' (sell HALF at +12%, ride the rest) tracked in
+    # parallel on the same entry stream -- see 126_mg_shadow_b.py. It places
+    # nothing and keeps its own state; the try/except means a shadow bug can
+    # never break the live plan. Its one-liner is appended to the plan text
+    # BEFORE --notify so the daily Telegram carries the A-vs-B' comparison.
+    try:
+        _sp2 = _ilu.spec_from_file_location("_shadow", ROOT / "code" / "126_mg_shadow_b.py")
+        _shadow = _ilu.module_from_spec(_sp2); _sp2.loader.exec_module(_shadow)
+        _line = _shadow.update(plan["watch"], plan["prices"], stamp)
+        if _line:
+            print(_line)
+            txt += "\n" + _line
+            (PLANS / f"closeplan_{stamp}.txt").write_text(txt)
+            (PLANS / "latest.txt").write_text(txt)
+    except Exception as _e:
+        print(f"[123] shadow ledger failed (non-fatal): {_e}")
     if a.notify:
         subprocess.run([PY, str(ROOT / "code" / "122_mg_plan_notify.py")], cwd=ROOT)
