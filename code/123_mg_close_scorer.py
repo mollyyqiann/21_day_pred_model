@@ -31,13 +31,13 @@ RULES ENCODED
 -------------
 ENTRY  top-5 by raw_margin, first appearance of that ticker only,
        extension indicator FAVOURABLE (0 of 3 flags), free slot.
-EXIT   take profit +30%; or out of top-15 for 2 consecutive publication days
+EXIT   take profit +12%; or out of top-15 for 2 consecutive publication days
        (minimum 2-day hold); or 21 trading days.
 SIZE   8 slots, equal weight, fractional (dollar) orders -- regular hours only.
 
-TP is +30%, not the +12% an earlier pass suggested. That +12% was an artifact
-of an unrealistic same-close entry; under every realistic fill tested
-(09:30 through 15:55) the ordering was TP30 > TP20 > TP12.
+TP is +12% as of 2026-09-09 (previously +30%). Read the note above TAKE_PROFIT
+before changing it: the two levels come from analyses that contradict each
+other and the disagreement is NOT settled.
 
 STANDING CAVEAT
 ---------------
@@ -51,7 +51,7 @@ Usage:
     python 123_mg_close_scorer.py --notify    # also send it to Telegram
 Schedule: weekdays 15:45 ET.
 """
-import sys, json, subprocess, argparse
+import os, sys, json, subprocess, argparse
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
@@ -64,7 +64,23 @@ PY = sys.executable
 
 SLOTS = 8
 SLOT_DOLLARS = 125
-TAKE_PROFIT = 0.30
+# Take profit. 0.12 is the v1 level from code/121_mg_trade_plan.py, adopted
+# 2026-09-09 on the instruction to "hook 121 onto robinhood": once the two
+# scripts were diffed, TAKE_PROFIT was the ONLY rule that differed between
+# them -- slots, 21-day cap, dropout, min-hold and all three extension
+# thresholds are identical -- so running 121's rule set live means this number
+# and nothing else. Attaching 121 itself to the broker would instead put two
+# schedulers on one account, both writing mg_paper_positions.json and both
+# buying the same top-5 names.
+#
+# ⚠ CONTRADICTION, UNRESOLVED. This file's docstring used to argue for 0.30 on
+# the grounds that TP30 > TP20 > TP12 under every realistic fill tested. A
+# later analysis says the opposite: +30% fires on only ~11% of picks, while the
+# measured MFE of FAVOURABLE picks is a median +12.27%, peaking around day 14
+# and giving back ~10.4pp from peak to close. Both cannot be right, and which
+# one is has not been settled. It is a single number: override it with
+# MG_TAKE_PROFIT=0.30 without editing this file, or change the default here.
+TAKE_PROFIT = float(os.environ.get("MG_TAKE_PROFIT") or 0.12)
 MAX_HOLD_DAYS = 21
 DROPOUT_DAYS = 2
 MIN_HOLD_DAYS = 2
