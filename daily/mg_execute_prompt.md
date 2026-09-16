@@ -45,13 +45,26 @@ current positions (symbol → quantity) and the available buying power.
 
 Sells free up buying power for the buys, so do them first.
 
+Each sell carries a `portion` field: `"all"` or `"half"`. The `+12%` take
+profit sells HALF and deliberately leaves the rest running; every other reason
+(stop loss, 21-day cap, out of top-15) sells everything. Selling the whole
+position on a `"half"` row would silently revert the strategy's exit rule.
+
 For each entry in the plan's `sells`:
 
 - Find that ticker in the live positions. **If it is not held, skip it** and
   note "not held" — the state file drifted, and there is nothing to sell.
-- If held, place a market sell for the **full** live quantity:
+- Work out the quantity to sell from the **live** position, never from the
+  plan's `quantity` field (that one is computed from the last reconciled state
+  and can be stale — it is a cross-check only, and if it differs from your
+  number by more than a few percent, say so in the Telegram):
+  - `portion: "all"`  → the full live quantity
+  - `portion: "half"` → live quantity × `fraction`, rounded DOWN to 6 decimal
+    places. If that is below 0.000001, or the position is a single whole share
+    that cannot be split, sell nothing for that row and report it.
+- Place it:
   `place_equity_order(account_number="{{ACCOUNT}}", symbol=<ticker>, side="sell",
-   type="market", quantity=<full live quantity, as a string>,
+   type="market", quantity=<the quantity you just computed, as a string>,
    market_hours="regular_hours", time_in_force="gfd", ref_id=<fresh UUID>)`
 
 ## 5. Buys
@@ -90,9 +103,18 @@ the result to the reconciler — it is the thing that decides what the strategy
 believes it owns:
 
 ```
-/Users/mollyqian/anaconda3/bin/python3 /Users/mollyqian/stocks/code/124_mg_reconcile.py \
-  --account {{ACCOUNT}} --json '<the positions array as JSON: objects with symbol, quantity, average_buy_price>'
+/Users/mollyqian/anaconda3/bin/python3 /Users/mollyqian/stocks/code/124_mg_reconcile.py --account {{ACCOUNT}} --json '<positions array: [{"symbol":...,"quantity":...,"average_buy_price":...}]>'
 ```
+
+⚠ FORMAT IS LOAD-BEARING. This command MUST be issued as ONE single line: the
+exact binary path above, no `cd` prefix, no backslash line-continuations, and
+the --json argument as COMPACT single-line JSON (no pretty-printing, no
+embedded newlines anywhere in the command). The permission allowlist that lets
+this run unattended is a prefix rule, and prefix rules do not apply to
+commands containing newlines — a multi-line version of this exact command gets
+blocked with "requires approval", nobody is here to approve it, and the run
+ends with real fills recorded nowhere. That is precisely what happened on
+2026-09-14.
 
 Then send exactly one Telegram — always, on every run, including the runs where
 nothing happened. A silent day is indistinguishable from a job that never fired,
@@ -102,15 +124,22 @@ so "no orders today" is itself the result the user is waiting for:
 /Users/mollyqian/anaconda3/bin/python3 /Users/mollyqian/stocks/code/notify.py --channel trade "<summary>"
 ```
 
+⚠ Same single-line rule as the reconciler: the whole command, including the
+quoted summary, must contain NO newline characters. Write the summary as one
+line using " | " between items (e.g. `MG 15:55 EXEC — sold HUM 0.3111 | bought
+SNDK $125 @1557.17 | bought GLW $125 @143.37 | recon +2/-1/keep 5`). A
+multi-line summary makes the whole command multi-line and it will be blocked
+unattended.
+
 `--channel trade` routes this to @Claude_Trade_robinhood_bot, which carries
 execution receipts only. Do not omit the flag — without it the receipt lands in
 the general model-output stream and gets lost.
 
-The summary is plain text, under ~15 lines, and says: what was sold (ticker and
-quantity), what was bought (ticker and dollar amount), the fill price where the
-order came back with one, anything skipped and why, and the reconciler's
-add/close/keep counts. Lead with `MG 15:55 EXEC` so it is greppable. If nothing
-was traded, one line saying why is enough.
+The summary is ONE line of plain text, " | "-separated, and says: what was
+sold (ticker, quantity, half or full), what was bought (ticker and dollar
+amount), fill prices where returned, anything skipped and why, and the
+reconciler's add/close/keep counts. Lead with `MG 15:55 EXEC` so it is
+greppable. If nothing was traded, one short clause saying why is enough.
 
 Do not put model scores, margins, or pick rationale in the Telegram — the plan
 message at 15:45 already carried those, and this message is an execution

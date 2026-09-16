@@ -28,6 +28,7 @@ ROOT="/Users/mollyqian/stocks"
 PY="/Users/mollyqian/anaconda3/bin/python3"
 LOG="$ROOT/output/monthly_gainer/execute.log"
 MODE="${MG_EXEC_MODE:-live}"
+RUNOUT="$(mktemp /tmp/mg_execute_run.XXXXXX)"
 cd "$ROOT"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
@@ -132,8 +133,9 @@ claude -p "$PROMPT" \
     "Bash(date:*)" \
     "Bash($PY $ROOT/code/124_mg_reconcile.py:*)" \
     "Bash($PY $ROOT/code/notify.py:*)" \
-  >> "$LOG" 2>&1
+  > "$RUNOUT" 2>&1
 RC=$?
+cat "$RUNOUT" >> "$LOG"
 
 log "=== claude exited rc=$RC ==="
 
@@ -142,5 +144,29 @@ log "=== claude exited rc=$RC ==="
 if [ "$RC" -ne 0 ]; then
   alert "executor session failed (rc=$RC). Check output/monthly_gainer/execute.log. Orders may be PARTIALLY placed — verify in Robinhood."
 fi
+
+# POST-RUN AUDIT -- added 2026-09-16 after the 09-14 silent failure. That
+# session placed 4 real orders, then had its reconcile and Telegram commands
+# blocked by the permission gate (prefix allowlist rules do not apply to
+# commands containing newlines), and exited rc=0: fills recorded nowhere, no
+# receipt, no error. The session cannot be trusted to report its own failure
+# to report, so the WRAPPER (plain bash, no permission gate) audits it:
+#   1. if the plan had orders, data/mg_paper_positions.json must have been
+#      reconciled today;
+#   2. the session output must not contain a permission denial.
+# Either miss -> a wrapper-side Telegram, which cannot be blocked.
+if [ "$MODE" = "live" ]; then
+  N_ORDERS=$("$PY" -c "import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get('sells',[]))+len(d.get('buys',[])))" "$PLAN" 2>/dev/null || echo 0)
+  RECON_DAY=$("$PY" -c "import json,sys; print(str(json.load(open(sys.argv[1])).get('last_reconciled',''))[:10])" "$ROOT/data/mg_paper_positions.json" 2>/dev/null)
+  if [ "$N_ORDERS" -gt 0 ] && [ "$RECON_DAY" != "$TODAY" ]; then
+    log "AUDIT: plan had $N_ORDERS order(s) but state was last reconciled '$RECON_DAY' -> alert"
+    alert "AUDIT FAIL: today's plan had $N_ORDERS order(s) but the position state was NOT reconciled today (last: $RECON_DAY). Orders may have filled unrecorded — check Robinhood, then run 124_mg_reconcile.py manually."
+  fi
+  if grep -qiE "requires approval|denied by|permission gate|blocked by" "$RUNOUT"; then
+    log "AUDIT: session output mentions a permission denial -> alert"
+    alert "AUDIT WARN: the executor session hit a permission denial mid-run (see execute.log $TODAY). Verify the receipt and the reconcile happened."
+  fi
+fi
+rm -f "$RUNOUT"
 
 exit "$RC"
