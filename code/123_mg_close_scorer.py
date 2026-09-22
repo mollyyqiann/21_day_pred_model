@@ -23,23 +23,44 @@ ticker-days the 15:45 provisional bar vs the true close agrees on:
   FAVOURABLE vs not         97.72%      (dd60 corr 0.871, p5 corr 0.935)
 The 413 disagreements sit on the dd60 = -0.10 boundary, as expected.
 
-But note the 15:45 PRICE runs ~+0.43% above the close on average, so score at
-15:45 and FILL at 15:55 -- the decision is stable over those ten minutes while
-the entry price improves by roughly that much.
+CORRECTED 2026-09-10. This block used to claim the 15:45 price runs ~+0.43%
+above the close, so that scoring at 15:45 and filling at 15:55 improved the
+entry by about that much. Re-measured on 2,933 ticker-days of real 1-minute
+bars (data/intraday_store, 2026-04..09, this strategy's own names) that is not
+true:
+
+  15:55 vs the 15:59 close   mean -0.039%  sd 0.315%   <- the fill assumption
+  15:45 vs the 15:59 close   mean -0.052%  sd 0.655%
+  drift 15:45 -> 15:55       mean -0.013%  sd 0.535%
+
+The first line reproduces the fill measurement above almost exactly (-0.04%,
+sd 0.39%), which is what makes the second and third credible. There is NO
+systematic +0.43% pickup between the decision and the fill -- the drift is a
+coin flip with a half-percent standard deviation. That drift is the real,
+unmodelled friction in every backtest of this strategy: they all treat the
+decision price and the fill price as the same close. It is symmetric, so it
+does not bias the mean, but a single position can be filled 0.5-1% away from
+the price its exit rule was evaluated against.
 
 RULES ENCODED
 -------------
-ENTRY  top-5 by raw_margin, first appearance of that ticker only,
-       extension indicator FAVOURABLE (0 of 3 flags), free slot.
-EXIT   take profit +12%; or stop loss -15%; or out of top-15 for 2
-       consecutive publication days (minimum 2-day hold); or 21 trading days.
-       TP and SL are checked once daily at 15:45 against the same-session
-       price and are exempt from the minimum hold.
+ENTRY  top-5 by raw_margin, extension indicator FAVOURABLE (0 of 3 flags),
+       free slot, not already held, and past both re-entry gates: the
+       wash-sale window (WASH_DAYS, losing exits) and the re-entry cooldown
+       (REENTRY_COOLDOWN, every exit). Until 2026-09-09 this was "first
+       appearance ever".
+EXIT   NO take profit (2026-09-10; see TAKE_PROFIT). Stop loss -15%, out of
+       top-15 for 2 consecutive publication days (minimum 2-day hold), and the
+       21-trading-day cap. A target, if MG_TAKE_PROFIT re-enables one, sells
+       half and keeps the slot. TP and SL are checked once daily at 15:45
+       against the same-session price and are exempt from the minimum hold.
 SIZE   8 slots, equal weight, fractional (dollar) orders -- regular hours only.
 
-TP is +12% as of 2026-09-09 (previously +30%). Read the note above TAKE_PROFIT
-before changing it: the two levels come from analyses that contradict each
-other and the disagreement is NOT settled.
+There is no take profit as of 2026-09-10. 136 adjudicated the old
++12%-vs-+30% argument (the level was the wrong question -- size was) and 137
+then replayed the rules over 31 months instead of 4 and found no cap beats
+every cap, on return, volatility and drawdown alike. Read the note above
+TAKE_PROFIT before putting one back.
 
 STANDING CAVEAT
 ---------------
@@ -75,14 +96,63 @@ SLOT_DOLLARS = 125
 # schedulers on one account, both writing mg_paper_positions.json and both
 # buying the same top-5 names.
 #
-# ⚠ CONTRADICTION, UNRESOLVED. This file's docstring used to argue for 0.30 on
-# the grounds that TP30 > TP20 > TP12 under every realistic fill tested. A
-# later analysis says the opposite: +30% fires on only ~11% of picks, while the
-# measured MFE of FAVOURABLE picks is a median +12.27%, peaking around day 14
-# and giving back ~10.4pp from peak to close. Both cannot be right, and which
-# one is has not been settled. It is a single number: override it with
-# MG_TAKE_PROFIT=0.30 without editing this file, or change the default here.
-TAKE_PROFIT = float(os.environ.get("MG_TAKE_PROFIT") or 0.12)
+# ADJUDICATED 2026-09-09 by code/136_tp_adjudication.py -- and the verdict is
+# that BOTH sides were arguing about the wrong thing. The +12% case (135) was
+# measured on all 280 top-5 rows, 43% of which are 9th-or-later re-appearances
+# of a name (mean 21d -10.60%) that this script can never buy, because entry is
+# first-appearance-only. On the 34 first appearances -- the tradeable set --
+# hold-21d is +3.58% and every FULL take-profit loses to it, with full+12%
+# the worst rule tested by worst-month regret (-9.02pp). The fat-tail claim
+# reproduces there (top-3 +71.3%, rest -3.0%). Two claims died in the process:
+# "+12% is a same-close-entry artifact" is false (it survives both entry and
+# both fill models), and "median MFE = +12.27%, so target +12%" is not a valid
+# inference (spearman(peak day, 21d return) = +0.652, n=280 -- winners peak on
+# day ~15, losers on day ~6, so a fixed target sells the winners early).
+# What the level actually rides on is regime: TP12 - hold is -9.0pp in May,
+# +8.5pp in June, 0.0pp in July. Three months, three answers.
+# SUPERSEDED 2026-09-10 by code/137_pit_replay.py, which replayed the whole
+# rule set over 2024-02..2026-08 -- 193 positions and ~31 independent 21-day
+# windows against the 4 the live pick history gives. On that sample the
+# take-profit level is monotone in the OTHER direction, and the best setting
+# is not to have one (account level, $1000 book, fixed $125 slots):
+#
+#   rule        per position   account/yr    vol    maxDD
+#   half +12%       +4.06%       +31.1%     20.4%   -17.5%
+#   half +20%       +4.38%       +33.1%     20.3%   -17.8%
+#   half +30%       +4.58%       +34.4%     20.1%   -18.1%
+#   NO take profit  +4.63%       +34.6%     19.5%   -15.5%
+#
+# No cap wins on return AND on volatility AND on drawdown, because a target
+# sells the names that trend to the end of the window and leaves the book
+# holding the ones that do not. The 2026-06 fat-tail analysis was right and
+# the +12% here was an artifact of a 4-month sample -- see 136 for why that
+# sample was measuring a pick population the strategy cannot even buy.
+#
+# So TAKE_PROFIT is now 0 = DISABLED. Exits are the stop, the 21-day cap and
+# the dropout rule. Set MG_TAKE_PROFIT=0.30 to put a target back; it will sell
+# TAKE_PROFIT_PORTION, which is still the one thing both samples agreed on.
+TAKE_PROFIT = float(os.environ.get("MG_TAKE_PROFIT") or 0)   # 0 = no target
+
+# How much of the position the target sells. 0.5 = sell half, ride the rest to
+# the stop or the 21-day cap; 1.0 restores the old sell-everything behaviour.
+#
+# This is the answer to the contradiction above, and it is not a compromise for
+# its own sake. Measured on the 34 first appearances (136_tp_adjudication.py),
+# mean 21d P&L per position, by month:
+#            hold    full+12%  full+30%  half+8%  half+12%  half+30%
+#   May    +16.72%     +7.70%   +12.80%  +13.77%   +12.21%   +14.76%
+#   Jun     -8.15%     +0.39%    -8.15%   -4.85%    -3.88%    -8.15%
+#   Jul     -8.01%     -8.01%    -8.01%   -7.01%    -8.01%    -8.01%
+#   worst month vs hold  -9.02pp  -3.92pp  -2.95pp   -4.51pp   -1.96pp
+# Half-out beats full-out at the SAME level in every month and in both
+# populations, because the two analyses were each half right: most picks do
+# pop and fade (so take something), and the mean is made by 3 names that
+# trend to the end of the window (so do not take it all). full+12% -- what
+# ran here until today -- was the worst rule tested by worst-month regret.
+#
+# Do not read the pooled numbers as an edge. ~4 independent 21-day windows,
+# every confidence interval on the tradeable set crosses zero.
+TAKE_PROFIT_PORTION = float(os.environ.get("MG_TAKE_PROFIT_PORTION") or 0.5)
 
 # Stop loss, added 2026-09-10. Before this the strategy had NO adverse-move
 # exit at all: the dropout rule is structurally unreachable (raw_margin is a
@@ -100,9 +170,103 @@ TAKE_PROFIT = float(os.environ.get("MG_TAKE_PROFIT") or 0.12)
 # through the level exits at the 15:55 price, not at -15%.
 # Override with MG_STOP_LOSS (e.g. 0.12); 0 disables it.
 STOP_LOSS = float(os.environ.get("MG_STOP_LOSS") or 0.15)
-MAX_HOLD_DAYS = 21
+# 26, not 21, as of 2026-09-21. 21 was never an exit optimization -- it was
+# inherited from the MODEL's target window (21-day +30% touch). A cap sweep on
+# 137's 31-month point-in-time replay (live rules, only the cap varied, open
+# book marked to the final close, total income on fixed $1000):
+#   cap 5 +$555 | 12 +$882 | 21 +$1,071 | 26 +$1,312 | 31 +$1,163 | none +$1,789
+# The relationship is "longer is better" because the cap's only real effect is
+# amputating the right tail (dropout already does the routine recycling: with
+# no cap at all, average hold is still ~21 days). No-cap is the sweep's max
+# but is carried by 3 multi-month rides, loses money in the choppy 2024, and
+# its edge over 21 is only P=84% by monthly bootstrap. 26 is the step the user
+# chose: +$241 over 21 on the replay (P=87%), one extra week of tail, without
+# going tail-dependent. The model's TARGET window stays 21 days -- this is a
+# holding rule, not a label change.
+MAX_HOLD_DAYS = 26
 DROPOUT_DAYS = 2
 MIN_HOLD_DAYS = 2
+
+# Re-entry. Until 2026-09-09 a name held once was blocked FOREVER
+# (`ever_entered`), which 124's docstring called the "first sighting only"
+# rule. Nothing in this repo ever tied that to tax, and it is not what the tax
+# rule says: a wash sale (IRC 1091) needs a sale at a LOSS plus a repurchase
+# within 30 days either side of it. The price you buy back at is irrelevant,
+# and a sale at a GAIN is never a wash sale. So the block is now exactly that
+# window and nothing wider.
+#
+# Blocked when the last full exit of a name was at a loss (or at an unknown
+# price -- see EXIT LOG below) and was 30 or fewer calendar days ago. Eligible
+# again on day 31.
+#
+# Two things this deliberately does NOT model, because the strategy's own
+# shape rules them out: the 30-days-BEFORE leg (it needs a second lot open
+# while the first is sold at a loss, and a held name can never be re-bought),
+# and cross-account identity (the rule spans all your accounts and a spouse's;
+# this book is one account and the tracker only ever sees it).
+#
+# Measured cost of the change: relaxing the entry rule this way took the
+# 4-month pick sample from 34 positions to 41 and the mean 21d P&L per
+# position from +3.58% to +2.65% (136_tp_adjudication.py). It buys more,
+# slightly worse names. Set WASH_DAYS enormous to restore the old behaviour.
+WASH_DAYS = int(os.environ.get("MG_WASH_DAYS") or 30)
+
+# Re-entry cooldown, added 2026-09-09 after measuring what the wash-sale
+# relaxation actually let in. It is a SEPARATE constraint from WASH_DAYS and
+# applies to every exit, winning or losing.
+#
+# Sequential simulation of this rule set over the 2026-05..09 pick history
+# (scratch: reentry2.py), P&L per position:
+#                      first entries        re-entries
+#   FAVOURABLE gate    -0.48% (n=23)     -3.11% (n=5)
+#   all top-5          +1.00% (n=34)     -8.31% (n=13)   diff 95% CI
+#                                                        [-17.97%,-0.89%]
+# 12 of those 13 re-entries followed a WINNING exit, and 10 were inside 30
+# days of it, so the wash-sale gate -- which only blocks LOSING exits -- never
+# touched the group that loses the money. The pattern is its own thing: a name
+# you just exited at a gain is still top-5 because it has been running, and
+# buying your own recent exit back is buying it extended.
+#
+# 60 days removes every re-entry in this sample, which is why the sample
+# cannot tell 60 apart from "never". 60 is the smaller claim, and it keeps the
+# name eligible eventually. Set MG_REENTRY_COOLDOWN=0 to allow re-entry as
+# soon as the tax rule permits.
+#
+# WASH_DAYS is a tax constraint and this is an empirical one. Tune this one.
+REENTRY_COOLDOWN = int(os.environ.get("MG_REENTRY_COOLDOWN") or 60)
+
+# EXIT LOG. state["exit_log"][ticker] = {"date": ISO, "gain": float|None}.
+# Written here at plan time for every FULL exit (the 15:45 gain is within a
+# few basis points of the 15:55 fill), and by 124_mg_reconcile.py with
+# gain=None when a position disappears from the broker without this script
+# having planned the exit -- a manual sale, or an exit whose price we never
+# saw. gain=None is treated as a LOSS: blocking a name we might have been
+# allowed to re-buy costs one skipped entry, while re-buying into a real wash
+# sale costs a disallowed loss, so the unknown side errs toward waiting.
+def entry_block(ticker, exit_log, today):
+    """Return None if the name is buyable, else a short reason string.
+
+    Two independent gates, whichever binds longer: the wash-sale window (tax,
+    losing exits only) and the re-entry cooldown (empirical, every exit)."""
+    e = (exit_log or {}).get(ticker)
+    if not e or not e.get("date"):
+        return None
+    try:
+        sold = datetime.fromisoformat(str(e["date"])).date()
+    except ValueError:
+        return None
+    days = (today - sold).days
+    gain = e.get("gain")
+    # gain is None -> price unknown -> treated as a loss, see EXIT LOG above.
+    if (gain is None or gain <= 0) and days <= WASH_DAYS:
+        kind = "loss" if gain is not None else "unknown price"
+        return (f"wash-sale window ({kind} sale {days}d ago, "
+                f"free in {WASH_DAYS - days + 1}d)")
+    if REENTRY_COOLDOWN and days <= REENTRY_COOLDOWN:
+        return (f"re-entry cooldown (exited {days}d ago, "
+                f"free in {REENTRY_COOLDOWN - days + 1}d)")
+    return None
+
 FILL_WINDOW = "15:55 ET"
 
 # The strategy trades ONLY the dedicated Agentic Robinhood account. The 15:55
@@ -147,7 +311,7 @@ def build():
     top15 = set(ranked.ticker)
     st = load_state()
     openp = {p["ticker"]: p for p in st["positions"]}
-    ever = set(st["ever_entered"])
+    exit_log = st.setdefault("exit_log", {})
 
     # Same-session prices for the held names. This is the take-profit input:
     # without it TAKE_PROFIT was a printed footer with no code behind it, and
@@ -155,7 +319,8 @@ def build():
     # the dropout rule never fires either) the only reachable exit was the
     # 21-day cap. Positions could only ever accumulate.
     prices = dict(zip(d.ticker, d.close))
-    today = datetime.now().date().isoformat()
+    today_d = datetime.now().date()
+    today = today_d.isoformat()
 
     exits, warnings = [], []
     for t, p in openp.items():
@@ -176,35 +341,73 @@ def build():
             # so its take-profit silently stops working. Say so out loud.
             warnings.append(f"{t}: no price in today's score file — take-profit NOT evaluated")
 
-        why = None
-        if gain is not None and gain >= TAKE_PROFIT:
-            # Take profit outranks everything and ignores MIN_HOLD_DAYS: the
-            # target is hit, the reason to hold is gone.
-            why = f"take profit {gain*100:+.1f}%"
-        elif STOP_LOSS and gain is not None and gain <= -STOP_LOSS:
-            # Stop loss: same priority logic as the take profit and likewise
-            # exempt from MIN_HOLD_DAYS -- a day-1 crash is exactly the case
-            # it exists for. The dropout rule cannot do this job (see the
-            # STOP_LOSS note above): falling RAISES a name's rank here.
+        # FULL exits are evaluated first. The take profit is now partial, so
+        # it no longer "outranks everything": on a day that is both +12% and
+        # day 21, the cap has to win or the last half would never be sold.
+        why, portion = None, 1.0
+        if STOP_LOSS and gain is not None and gain <= -STOP_LOSS:
+            # Stop loss is exempt from MIN_HOLD_DAYS -- a day-1 crash is
+            # exactly the case it exists for. The dropout rule cannot do this
+            # job (see the STOP_LOSS note above): falling RAISES a name's rank.
             why = f"stop loss {gain*100:+.1f}%"
         elif held >= MAX_HOLD_DAYS:
-            why = "21-day cap"
+            why = f"{MAX_HOLD_DAYS}-day cap"
         elif held > MIN_HOLD_DAYS and miss >= DROPOUT_DAYS:
             why = f"out of top-15 for {miss}d"
+        elif TAKE_PROFIT and gain is not None and gain >= TAKE_PROFIT and not p.get("half_done"):
+            # Partial take profit, once per position, exempt from
+            # MIN_HOLD_DAYS. The position keeps its slot afterwards.
+            why, portion = f"take profit {gain*100:+.1f}%", TAKE_PROFIT_PORTION
+        elif (TAKE_PROFIT and gain is not None and gain >= TAKE_PROFIT and p.get("half_done")
+              and p.get("qty_before_tp") and float(p.get("quantity") or 0)
+              >= 0.9 * float(p["qty_before_tp"])):
+            # Self-heal: half_done is set when the plan is WRITTEN, but the
+            # 15:55 executor can skip a sell (not held, review error, session
+            # died). If the reconciled quantity never actually fell and the
+            # name is still above the target, re-issue the trim rather than
+            # leave the position marked as trimmed forever.
+            why, portion = f"take profit {gain*100:+.1f}% (retry)", TAKE_PROFIT_PORTION
+            warnings.append(f"{t}: earlier trim never reduced the position — re-issuing")
+
         if why:
+            qty = float(p.get("quantity") or 0) or None
+            if portion < 1.0:
+                # Mark at plan time, like days_held above: the state file is
+                # written before the executor runs, and the retry branch is
+                # what covers a sell that never landed.
+                p["half_done"] = True
+                p["qty_before_tp"] = qty
+            else:
+                # Full exit: this is the sale the wash-sale window is measured
+                # from. Recorded at plan time rather than after the fill,
+                # because nothing downstream ever learns the exit price --
+                # 124 only sees that the position vanished.
+                exit_log[t] = {"date": today,
+                               "gain": round(gain, 4) if gain is not None else None,
+                               "source": "plan", "reason": why}
             exits.append({"ticker": t, "reason": why, "days_held": held,
+                          "portion": "half" if portion < 1.0 else "all",
+                          "fraction": round(portion, 4),
+                          "quantity": round(qty * portion, 6) if qty else None,
                           "gain": round(gain, 4) if gain is not None else None})
 
         p["days_out_of_top15"] = miss
         p["last_counted"] = today
 
-    free = SLOTS - (len(openp) - len(exits))
+    # A trimmed position still occupies its slot -- only a full exit frees one.
+    full_exits = [e for e in exits if e["fraction"] >= 1.0]
+    free = SLOTS - (len(openp) - len(full_exits))
     entries, watch = [], []
     for r in ranked.head(5).to_dict("records"):
+        t = r["ticker"]
         fl = flags(r); b = band(len(fl))
-        watch.append({"ticker": r["ticker"], "band": b, "flags": fl,
-                      "held": r["ticker"] in openp})
-        if b == "FAVOURABLE" and r["ticker"] not in openp and r["ticker"] not in ever:
+        # A name being sold TODAY cannot be re-bought today: both windows
+        # open on the sale, and exit_log is written above before this loop
+        # runs, so entry_block already sees it.
+        blocked = entry_block(t, exit_log, today_d)
+        watch.append({"ticker": t, "band": b, "flags": fl,
+                      "held": t in openp, "blocked": blocked})
+        if b == "FAVOURABLE" and t not in openp and not blocked:
             entries.append(r)
     entries = entries[:max(0, free)]
     return {"asof": asof, "exits": exits, "entries": entries, "watch": watch,
@@ -224,9 +427,11 @@ def render(p):
         m = {"FAVOURABLE": "++", "NEUTRAL": " ~", "EXTENDED": "--"}[w["band"]]
         L.append(f"  {m} {w['ticker']:<6} {w['band']:<11}"
                  + (f"  {', '.join(w['flags'])}" if w["flags"] else "")
-                 + ("  [HELD]" if w["held"] else ""))
+                 + ("  [HELD]" if w["held"] else "")
+                 + (f"  [BLOCKED: {w['blocked']}]" if w.get("blocked") else ""))
     L += ["", f"SELL ({len(p['exits'])}):"]
-    L += [f"  - {e['ticker']:<6} {e['reason']} (held {e['days_held']}d)" for e in p["exits"]] or ["  (none)"]
+    L += [f"  - {e['ticker']:<6} {'HALF' if e['fraction'] < 1 else 'ALL '} "
+          f"{e['reason']} (held {e['days_held']}d)" for e in p["exits"]] or ["  (none)"]
     if p.get("warnings"):
         L += [""] + [f"  !! {w}" for w in p["warnings"]]
     L += ["", f"BUY ({len(p['entries'])}):"]
@@ -235,8 +440,12 @@ def render(p):
             L.append(f"  + {e['ticker']:<6} ~${SLOT_DOLLARS} fractional  (last ${e['close']:.2f}, "
                      f"margin {e['raw_margin']:+.2f})")
     else:
-        L.append("  (none — no FAVOURABLE first-time names, or no free slot)")
-    L += ["", f"Standing exits: +{TAKE_PROFIT*100:.0f}% take profit | "
+        L.append("  (none — no FAVOURABLE buyable names, or no free slot)")
+    tp_txt = (f"+{TAKE_PROFIT*100:.0f}% take profit (sells {TAKE_PROFIT_PORTION:.0%}, "
+              f"keeps the slot) | " if TAKE_PROFIT else "no take profit | ")
+    L += ["", f"Re-entry: {WASH_DAYS}d wash-sale block after a losing exit, and a "
+              f"{REENTRY_COOLDOWN}d cooldown after ANY exit.",
+          f"Standing exits: {tp_txt}"
               f"-{STOP_LOSS*100:.0f}% stop loss | "
               f"2 days out of top-15 | {MAX_HOLD_DAYS}-day cap",
           f"Executor fires at {FILL_WINDOW} and sends its own receipt.",
@@ -292,7 +501,14 @@ if __name__ == "__main__":
         "open": plan["open"],
         "free_after_exits": plan["free"],
         "slot_dollars": SLOT_DOLLARS,
+        # `portion`/`fraction` tell the 15:55 executor how much to sell:
+        # "all" = the full live quantity, "half" = live quantity x fraction.
+        # `quantity` is this script's own estimate from the last reconciled
+        # state and is a cross-check only -- the executor sizes off the LIVE
+        # quantity, because that is the one that cannot be stale.
         "sells": [{"ticker": e["ticker"], "reason": e["reason"],
+                   "portion": e["portion"], "fraction": e["fraction"],
+                   "quantity": e.get("quantity"),
                    "days_held": e["days_held"], "gain": e.get("gain")}
                   for e in plan["exits"]],
         "warnings": plan.get("warnings", []),
@@ -305,11 +521,14 @@ if __name__ == "__main__":
     (PLANS / f"closeplan_{stamp}.json").write_text(body)
     (PLANS / "latest.json").write_text(body)
     STATE.write_text(json.dumps(plan["state"], indent=2, default=str))
-    # Shadow ledger: exit-rule B' (sell HALF at +12%, ride the rest) tracked in
-    # parallel on the same entry stream -- see 126_mg_shadow_b.py. It places
-    # nothing and keeps its own state; the try/except means a shadow bug can
-    # never break the live plan. Its one-liner is appended to the plan text
-    # BEFORE --notify so the daily Telegram carries the A-vs-B' comparison.
+    # Shadow ledger: the take-profit counterfactual -- rule A, sell EVERYTHING
+    # at +12% -- tracked in parallel on the same entry stream. Until today the
+    # shadow held the half-out rule and the live book sold everything; 136's
+    # adjudication swapped them, so 126_mg_shadow_b.py now shadows the rule
+    # this script just stopped running. It places nothing and keeps its own
+    # state; the try/except means a shadow bug can never break the live plan.
+    # Its one-liner is appended to the plan text BEFORE --notify so the daily
+    # Telegram carries the A-vs-B' comparison.
     try:
         _sp2 = _ilu.spec_from_file_location("_shadow", ROOT / "code" / "126_mg_shadow_b.py")
         _shadow = _ilu.module_from_spec(_sp2); _sp2.loader.exec_module(_shadow)

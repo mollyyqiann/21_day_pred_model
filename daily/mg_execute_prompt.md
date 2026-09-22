@@ -47,7 +47,7 @@ Sells free up buying power for the buys, so do them first.
 
 Each sell carries a `portion` field: `"all"` or `"half"`. The `+12%` take
 profit sells HALF and deliberately leaves the rest running; every other reason
-(stop loss, 21-day cap, out of top-15) sells everything. Selling the whole
+(stop loss, the hold cap, out of top-15) sells everything. Selling the whole
 position on a `"half"` row would silently revert the strategy's exit rule.
 
 For each entry in the plan's `sells`:
