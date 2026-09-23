@@ -142,22 +142,49 @@ def fetch_recent(tickers, days=120):
     drops those tickers from the result. They succeed immediately on
     single-ticker sequential retry.
     """
-    print(f"[101] yfinance bulk download: {len(tickers)} tickers, {days}d window ...")
+    # Chunked, not one 500-ticker blast -- changed 2026-09-24 during the rate
+    # limit spiral. Yahoo's limiter reacts to burst shape as much as to
+    # volume: a single 501-name threaded download is exactly the profile that
+    # trips it (and then the whole run dies at once). ~60 names per request
+    # with a pause between chunks keeps the same total volume but a flat
+    # profile, and a limiter that bites mid-run now costs one chunk, not the
+    # day. MG_FETCH_CHUNK / MG_FETCH_PAUSE override.
+    chunk = int(os.environ.get("MG_FETCH_CHUNK") or 60)
+    pause = float(os.environ.get("MG_FETCH_PAUSE") or 12)
+    n_chunks = (len(tickers) + chunk - 1) // chunk
+    print(f"[101] yfinance chunked download: {len(tickers)} tickers, "
+          f"{n_chunks} x {chunk}, {pause:.0f}s between chunks, {days}d window ...")
     t0 = time.time()
-    data = yf.download(tickers, period=f"{days}d", interval="1d",
-                        auto_adjust=True, threads=True, progress=False, group_by="ticker")
-    print(f"[101] bulk download in {time.time()-t0:.0f}s")
     rows = []
     missing = []
-    for tk in tickers:
+    for ci in range(n_chunks):
+        batch = tickers[ci*chunk:(ci+1)*chunk]
         try:
-            df = data[tk] if isinstance(data.columns, pd.MultiIndex) else data
-        except Exception:
-            missing.append(tk); continue
-        df = df.dropna(subset=["Close"])
-        if df.empty:
-            missing.append(tk); continue
-        rows.append(_normalize_ohlcv(df, tk))
+            data = yf.download(batch, period=f"{days}d", interval="1d",
+                               auto_adjust=True, threads=True, progress=False,
+                               group_by="ticker")
+        except Exception as e:
+            print(f"[101]   chunk {ci+1}/{n_chunks}: download error {type(e).__name__}; "
+                  f"marking {len(batch)} missing")
+            missing.extend(batch)
+            time.sleep(pause)
+            continue
+        got = 0
+        for tk in batch:
+            try:
+                df = data[tk] if isinstance(data.columns, pd.MultiIndex) else data
+            except Exception:
+                missing.append(tk); continue
+            df = df.dropna(subset=["Close"])
+            if df.empty:
+                missing.append(tk); continue
+            rows.append(_normalize_ohlcv(df, tk))
+            got += 1
+        if got < len(batch):
+            print(f"[101]   chunk {ci+1}/{n_chunks}: {got}/{len(batch)}")
+        if ci + 1 < n_chunks:
+            time.sleep(pause)
+    print(f"[101] chunked download in {time.time()-t0:.0f}s")
 
     if missing:
         print(f"[101] retrying {len(missing)} bulk-failed tickers sequentially ...")

@@ -518,11 +518,11 @@ if __name__ == "__main__":
         import time as _time
         _t0 = _time.time()
         for _attempt in range(1, 4):
-            _remaining = 420 - (_time.time() - _t0)
+            _remaining = 480 - (_time.time() - _t0)   # chunked fetch is ~3min/attempt
             if _remaining < 60:
                 print("[123] retry budget exhausted")
                 break
-            rescore(timeout=min(300, int(_remaining)))
+            rescore(timeout=min(260, int(_remaining)))
             _ok, _why = _score_ok(_min_rows, _today)
             if _ok:
                 if _attempt > 1:
