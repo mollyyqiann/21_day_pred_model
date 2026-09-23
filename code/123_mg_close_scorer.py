@@ -332,14 +332,21 @@ def build():
             p["miss_base"] = int(p.get("days_out_of_top15", 0))
             p["days_held"] = int(p.get("days_held", 0)) + 1
         held = int(p.get("days_held", 0))
-        miss = 0 if t in top15 else int(p.get("miss_base", 0)) + 1
+        # A name absent from the score file is UNKNOWN, not out-of-rank: on the
+        # 60-row day (2026-09-23) two held names were missing because the
+        # download died, and counting that as "out of the top-15" put them one
+        # day from a dropout sale caused by an outage rather than a ranking.
+        if t not in prices:
+            miss = int(p.get("miss_base", 0))
+        else:
+            miss = 0 if t in top15 else int(p.get("miss_base", 0)) + 1
 
         px, entry = prices.get(t), p.get("entry_price")
         gain = (float(px) / float(entry) - 1.0) if px is not None and entry else None
         if gain is None:
             # A held name absent from the score file cannot be price-checked,
             # so its take-profit silently stops working. Say so out loud.
-            warnings.append(f"{t}: no price in today's score file — take-profit NOT evaluated")
+            warnings.append(f"{t}: no price in today's score file — gain exits AND dropout not evaluated")
 
         # FULL exits are evaluated first. The take profit is now partial, so
         # it no longer "outranks everything": on a day that is both +12% and
@@ -482,6 +489,38 @@ if __name__ == "__main__":
 
     if not a.skip_rescore:
         rescore()
+
+    # DATA GATE -- added 2026-09-23 after the 60-row day. 101 crashed mid-run
+    # (yfinance rate limit) and left a PARTIAL score file: 60 of ~501 names,
+    # dated today. The "use the existing file" fallback then fed it straight
+    # into build(): the top-15 was ranked inside a 60-name field, and two held
+    # names (CRL, WDAY) were counted "out of the top-15" -- one more such day
+    # and dropout would have SOLD them over a data outage. A partial file
+    # passes the executor's asof guard (its date IS today), so the check has
+    # to happen here, before any counter mutates or any plan is written.
+    # Bailing out leaves latest.json on yesterday's date, which the 15:55
+    # executor already refuses to trade -- same standdown path as a failed run.
+    _gate = pd.read_csv(OUT / "today_score_fresh_sp500.csv")
+    _rows = len(_gate)
+    _asof = str(_gate["date"].iloc[0]) if "date" in _gate.columns and len(_gate) else "?"
+    _today = datetime.now().date().isoformat()
+    _min_rows = int(os.environ.get("MG_MIN_UNIVERSE") or 400)
+    _bad = None
+    if _rows < _min_rows:
+        _bad = f"score file has {_rows} rows (< {_min_rows}) — partial download"
+    elif _asof != _today and not a.force:
+        _bad = f"score file is asof {_asof}, not today — stale fallback"
+    if _bad and not a.force:
+        msg = f"[123] DATA GATE: {_bad}. No plan written, no counters touched, nothing will trade."
+        print(msg)
+        if a.notify:
+            subprocess.run([PY, str(ROOT / "code" / "notify.py"),
+                            f"MG 15:45 — {_bad}. Standing down today; positions unchanged."],
+                           cwd=ROOT)
+        sys.exit(0)
+    if _bad:
+        print(f"[123] WARNING: {_bad} — proceeding anyway (--force)")
+
     plan = build()
     txt = render(plan)
     print(txt)
