@@ -422,7 +422,13 @@ def run_fetch_and_features(cache_path):
     sec_map = old_panel.dropna(subset=["sector"]).groupby("ticker")["sector"].first().to_dict()
 
     # Fetch fresh OHLCV
-    fresh = fetch_recent(tickers, days=120)
+    # 260, not 120 -- fixed 2026-09-23. ma60_slope_60d needs 120 trading bars
+    # (rolling(60).mean() then .shift(60)), and a 120d fetch delivers ~120 bars
+    # AT BEST: the slope was only ever valid on the final bar, so any ticker
+    # missing a single bar lost the feature entirely. On 09-23 that dropped
+    # 441/501 names out of "candidates with full features" and the day was
+    # ranked inside the surviving 60. With 260d there are ~110 bars of margin.
+    fresh = fetch_recent(tickers, days=260)
     # Coverage floor -- added 2026-09-23, the 60-row day. The sequential retry
     # above can itself be rate-limited, and this script used to shrug, score
     # whatever survived, and exit 0: downstream then ranked a "top-15" inside
