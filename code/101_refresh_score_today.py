@@ -17,10 +17,11 @@ the entire panel. Approach:
 Run with system Python (has yfinance): /usr/bin/python3
 """
 
-import sys; sys.stdout.reconfigure(line_buffering=True)
+import os, sys; sys.stdout.reconfigure(line_buffering=True)
 
 import warnings
 import time
+from importlib import import_module
 from pathlib import Path
 
 import joblib
@@ -37,6 +38,9 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 MODELS = ROOT / "models"
 OUT = ROOT / "output" / "monthly_gainer"
+
+sys.path.insert(0, str(ROOT / "code"))
+cat87 = import_module("87_catalyst_live_features")  # live catalyst-feature helpers
 
 
 def compute_v8_features(g: pd.DataFrame) -> pd.DataFrame:
@@ -120,27 +124,60 @@ def compute_v8_features(g: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
+def _normalize_ohlcv(df, tk):
+    df = df.reset_index().rename(columns={"Date": "date", "Open": "open",
+                                            "High": "high", "Low": "low",
+                                            "Close": "close", "Volume": "volume"})
+    df["ticker"] = tk
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None).dt.normalize()
+    return df[["date", "ticker", "open", "high", "low", "close", "volume"]]
+
+
 def fetch_recent(tickers, days=120):
+    """Threaded bulk fetch + sequential retry for tickers that came back empty.
+
+    The threaded yf.download contends on yfinance's SQLite cache (cookies.db,
+    tkr-tz.db). On busy runs (esp. ~500 tickers) the cache hits intermittent
+    "OperationalError: unable to open database file" and yfinance silently
+    drops those tickers from the result. They succeed immediately on
+    single-ticker sequential retry.
+    """
     print(f"[101] yfinance bulk download: {len(tickers)} tickers, {days}d window ...")
     t0 = time.time()
     data = yf.download(tickers, period=f"{days}d", interval="1d",
                         auto_adjust=True, threads=True, progress=False, group_by="ticker")
-    print(f"[101] downloaded in {time.time()-t0:.0f}s")
+    print(f"[101] bulk download in {time.time()-t0:.0f}s")
     rows = []
+    missing = []
     for tk in tickers:
         try:
             df = data[tk] if isinstance(data.columns, pd.MultiIndex) else data
         except Exception:
-            continue
+            missing.append(tk); continue
         df = df.dropna(subset=["Close"])
         if df.empty:
-            continue
-        df = df.reset_index().rename(columns={"Date": "date", "Open": "open",
-                                                "High": "high", "Low": "low",
-                                                "Close": "close", "Volume": "volume"})
-        df["ticker"] = tk
-        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None).dt.normalize()
-        rows.append(df[["date", "ticker", "open", "high", "low", "close", "volume"]])
+            missing.append(tk); continue
+        rows.append(_normalize_ohlcv(df, tk))
+
+    if missing:
+        print(f"[101] retrying {len(missing)} bulk-failed tickers sequentially ...")
+        t1 = time.time()
+        recovered = 0
+        still_missing = []
+        for tk in missing:
+            try:
+                h = yf.Ticker(tk).history(period=f"{days}d", auto_adjust=True)
+                if h.empty or h["Close"].notna().sum() == 0:
+                    still_missing.append(tk); continue
+                rows.append(_normalize_ohlcv(h.dropna(subset=["Close"]), tk))
+                recovered += 1
+            except Exception:
+                still_missing.append(tk)
+        print(f"[101] sequential retry recovered {recovered}/{len(missing)} "
+              f"in {time.time()-t1:.0f}s")
+        if still_missing:
+            print(f"[101] still missing after retry ({len(still_missing)}): "
+                  f"{still_missing[:15]}{'...' if len(still_missing) > 15 else ''}")
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
@@ -163,6 +200,177 @@ def fetch_spy_vix(days=400):
     vix["vix_chg_5d"] = vix["vix"].diff(5)
 
     return spy.merge(vix, on="date", how="outer")
+
+
+
+
+# Historical outcome by extension band, measured on 253 matured MG v3 top-5 picks
+# (2026-05-03..2026-07-27, 21-trading-day hold, re-scored 2026-08-26).
+# dd_60d = close / 60-day-high - 1, i.e. how far below its recent peak the name is.
+EXTENSION_BANDS = [
+    (-1.00, -0.25, ">25% below high",   +0.16, 53),
+    (-0.25, -0.15, "15-25% below",      +1.00, 41),
+    (-0.15, -0.08, "8-15% below",       -6.29, 31),
+    (-0.08, -0.03, "3-8% below",        -9.22, 20),
+    (-0.03,  1.00, "within 3% of high", -10.65, 27),
+]
+
+
+def extension_indicator(scored: pd.DataFrame, k: int = 5) -> str:
+    """Flag how EXTENDED each pick is -- the strongest outcome separator found.
+
+    Investigation 2026-08-26: across 253 matured top-5 picks, distance from the
+    60-day high separated winners from losers better than anything else tested,
+    including the model's own probability:
+
+        >25% below high   +0.16%   win 53%
+        15-25% below      +1.00%   win 41%
+        8-15% below       -6.29%   win 31%
+        3-8% below        -9.22%   win 20%
+        within 3% of high -10.65%  win 27%
+
+        spearman(dd_60d, 21d return) = -0.351, p<1e-5, and the sign held in
+        ALL THREE months tested -- the only candidate that was sign-stable.
+
+    Why it works: the model is a volatility/momentum ranker (71.6% of its feature
+    importance is volatility), so it systematically buys names that have already
+    run. Those mean-revert. `raw_margin` and `prob_cal` do NOT separate outcomes
+    -- prob_cal is INVERTED (highest-confidence quintile returned -10.54% and
+    touched +30% only 3.9% of the time, vs +2.61% / 17.6% for the lowest).
+
+    CAVEATS -- read before acting:
+      * 253 picks over 3 months. The SIGN is stable; the magnitudes will drift.
+      * This was selected by searching ~20 features on this same sample, so the
+        numbers are optimistic. Treat the band ORDERING as the signal.
+      * It only discriminates when the list actually spreads across bands. When
+        every pick is deeply drawn down (as on 2026-08-26), it says nothing.
+      * It does NOT make the model profitable. It separates bad from less-bad.
+    """
+    if "dd_60d" not in scored.columns:
+        return "[101] extension indicator: unavailable (dd_60d missing)"
+    top = scored.nlargest(k, "raw_margin")
+    lines = [f"[101] === EXTENSION INDICATOR (top-{k}) ===",
+             "[101]   how far below its 60-day high each pick is; historically the",
+             "[101]   strongest separator of good picks from bad."]
+    for r in top.itertuples():
+        dd = getattr(r, "dd_60d", float("nan"))
+        band, hist, win = "n/a", float("nan"), float("nan")
+        for lo, hi, name, h, w in EXTENSION_BANDS:
+            if lo <= dd < hi:
+                band, hist, win = name, h, w
+                break
+        mark = " <<" if hist == hist and hist < -5 else ""
+        lines.append(f"[101]   {r.ticker:<6} {dd*100:+6.1f}%  {band:<18} "
+                     f"hist {hist:+6.2f}%  win {win:3.0f}%{mark}")
+    bands = []
+    for r in top.itertuples():
+        dd = getattr(r, "dd_60d", float("nan"))
+        for lo, hi, name, h, w in EXTENSION_BANDS:
+            if lo <= dd < hi:
+                bands.append(name); break
+    if len(set(bands)) <= 1 and bands:
+        lines.append(f"[101]   >> all {k} picks are in the same band ({bands[0]}) -- "
+                     "the indicator cannot discriminate today.")
+    n_bad = sum(1 for b in bands if b in ("3-8% below", "within 3% of high"))
+    if n_bad:
+        lines.append(f"[101]   >> {n_bad} of {k} are near their highs -- historically the "
+                     "worst band (-9% to -11%, win 20-27%).")
+    return "\n".join(lines)
+
+
+
+# --- extension indicator -------------------------------------------------
+# Three entry-time flags, each independently significant on 253 matured
+# top-5 picks (2026-05..07). All three say the same thing: the model buys
+# names that have already moved, and those do worst.
+#
+#   flag                     flagged      clean      p
+#   within 10% of 60d high   -9.07%      -1.70%   0.00087
+#   up >2% over prior 5d     -8.41%      -2.34%   0.00611
+#   prob_cal > 0.33         -11.15%      -1.96%   0.00001   <- INVERTED
+#
+# Score = number of flags. Outcome is monotone in the score
+# (spearman -0.408, p<1e-6):
+#   0 flags  +2.23%  win 55%      2 flags  -6.37%  win 29%
+#   1 flag   -3.56%  win 36%      3 flags -19.93%  win  6%
+#
+# Note the third flag: the model's OWN confidence is anti-predictive. Its
+# high-conviction picks touch +30% 3.9% of the time vs 17.6% for its
+# low-conviction ones. This is an INDICATOR ONLY -- it does not re-rank.
+EXT_NEAR_HIGH = -0.10     # dd_60d above this = close to the 60-day high
+EXT_RAN_UP    =  0.02     # ret_5d_lag above this = already popped
+EXT_HIGH_CONF =  0.33     # prob_cal above this = model over-confident
+
+
+def extension_flags(row):
+    """Return (score, [reasons]) for one scored row. Higher = worse."""
+    f = []
+    dd = row.get("dd_60d")
+    if dd is not None and pd.notna(dd) and dd > EXT_NEAR_HIGH:
+        f.append("near 60d high")
+    r5 = row.get("ret_5d_lag")
+    if r5 is not None and pd.notna(r5) and r5 > EXT_RAN_UP:
+        f.append("up >2% in 5d")
+    pc = row.get("prob_cal")
+    if pc is not None and pd.notna(pc) and pc > EXT_HIGH_CONF:
+        f.append("high model conf")
+    return len(f), f
+
+
+def extension_band(score):
+    return "FAVOURABLE" if score == 0 else ("NEUTRAL" if score == 1 else "EXTENDED")
+
+
+def extension_report(top, k=5):
+    """Per-pick indicator lines for the top-k. Does NOT change the ranking."""
+    lines = ["[101] === EXTENSION INDICATOR (does not re-rank) ===",
+             "[101]   historical 21d return by band: "
+             "FAVOURABLE +2.23% (win 55%) | NEUTRAL -3.56% (36%) | EXTENDED -9.87% (23%)"]
+    for r in top.head(k).to_dict("records"):
+        sc, why = extension_flags(r)
+        band = extension_band(sc)
+        mark = {"FAVOURABLE": "++", "NEUTRAL": " ~", "EXTENDED": "--"}[band]
+        lines.append(f"[101]   {mark} {r['ticker']:<6} {band:<11} "
+                     f"({sc}/3)" + (f"  flags: {', '.join(why)}" if why else ""))
+    return "\n".join(lines)
+
+
+def vol_exposure_report(scored: pd.DataFrame, k: int = 5) -> str:
+    """Surface the volatility-factor exposure the picks are carrying.
+
+    Why this exists (investigation 2026-08-25): MG v3's label is a fixed +30%
+    barrier, which is a ~4.9-sigma move for a low-vol name but only ~2.8-sigma
+    for a high-vol one. That makes volatility the optimal predictor -- 71.6% of
+    the model's feature importance sits on vol features, and the prediction
+    decile maps monotonically onto vol quintile (0.20 -> 3.89). Out of sample
+    the model is matched by `df.nlargest(5,'rv_60')` and BEATEN by
+    `df.nlargest(5,'atr_pct')`, and forcing vol-neutral selection removes ~84%
+    of its apparent edge.
+
+    So the daily top-5 is, in substance, a leveraged long position in the
+    high-volatility factor. That bet was never chosen and was invisible in this
+    output. Printing it does not fix the model -- it just stops the exposure
+    being hidden.
+    """
+    if "rv_60" not in scored.columns or scored["rv_60"].notna().sum() < 50:
+        return "[101] vol exposure: unavailable (rv_60 missing)"
+    d = scored.dropna(subset=["rv_60"]).copy()
+    d["vol_q"] = pd.qcut(d["rv_60"].rank(method="first"), 5, labels=False)
+    sel = d.nlargest(k, "raw_margin")
+    mean_q = float(sel["vol_q"].mean())
+    top2 = float((sel["vol_q"] >= 3).mean())
+    lines = [
+        f"[101] === VOLATILITY EXPOSURE OF TOP-{k} ===",
+        f"[101]   mean vol quintile : {mean_q:.2f}   (2.00 = vol-neutral, 4.00 = only the most volatile)",
+        f"[101]   share in top-2 vol quintiles: {top2:.0%}   (40% would be neutral)",
+        f"[101]   median rv_60 picks {sel['rv_60'].median():.1%} vs universe {d['rv_60'].median():.1%}",
+    ]
+    if mean_q >= 3.0:
+        lines.append("[101]   >> These picks are a LONG-VOLATILITY FACTOR BET, not a "
+                     "stock-selection signal.")
+        lines.append("[101]   >> Out-of-sample this model is beaten by df.nlargest(5,'atr_pct'). "
+                     "Size accordingly.")
+    return "\n".join(lines)
 
 
 def main():
@@ -188,6 +396,19 @@ def run_fetch_and_features(cache_path):
 
     # Fetch fresh OHLCV
     fresh = fetch_recent(tickers, days=120)
+    # Coverage floor -- added 2026-09-23, the 60-row day. The sequential retry
+    # above can itself be rate-limited, and this script used to shrug, score
+    # whatever survived, and exit 0: downstream then ranked a "top-15" inside
+    # 60 names and nearly sold two healthy holdings as "out of the top-15".
+    # A mostly-failed fetch is a FAILED RUN: exit non-zero, write nothing, and
+    # let the caller (123's retry loop) back off and try again or stand down.
+    _got = fresh["ticker"].nunique() if not fresh.empty and "ticker" in fresh.columns else 0
+    _cov = _got / max(1, len(tickers))
+    _floor = float(os.environ.get("MG_MIN_FETCH_COVER") or 0.8)
+    if _cov < _floor:
+        print(f"[101] FATAL: fetched only {_got}/{len(tickers)} tickers ({_cov:.0%} < {_floor:.0%}); "
+              f"refusing to score a partial universe")
+        sys.exit(1)
     if fresh.empty:
         print("[101] yfinance returned nothing; abort")
         return
@@ -228,12 +449,45 @@ def run_fetch_and_features(cache_path):
 
     new_panel = new_panel.merge(regime[["date"] + REGIME_FEATS], on="date", how="left")
 
-    # Catalyst features: set to 0 (no fresh news pull)
-    CATALYST = ["finbert_max_5d", "finbert_max_20d", "finbert_mean_5d",
-                "news_n_5d", "news_n_20d", "earn_news_5d", "earn_news_20d",
-                "ma_news_5d", "ma_news_20d", "sector_pop_5d"]
-    for c in CATALYST:
-        new_panel[c] = 0.0
+    # Live catalyst features (finbert sentiment, news volume, earnings/M&A
+    # keyword flags, sector pop) — reuses the same rolling-window logic as
+    # the offline panel builder (87_catalyst_live_features.py), computed
+    # over the full fetched history (not yet truncated to last 10d) so the
+    # 5d/20d rolling windows have enough lookback.
+    print("[101] computing live catalyst features ...")
+    fb_path = DATA / "finbert_scores.csv"
+    if fb_path.exists():
+        fb_full = pd.read_csv(fb_path, parse_dates=["date"])
+    else:
+        fb_full = pd.DataFrame(columns=["ticker", "date", "finbert_max", "finbert_mean", "finbert_n"])
+
+    p = new_panel[["ticker", "date", "close", "sector"]].sort_values(["ticker", "date"]).copy()
+    p["close_t-1"] = p.groupby("ticker")["close"].shift(1)
+    p["close_t-6"] = p.groupby("ticker")["close"].shift(6)
+    p["ret_5d_lag_pop"] = p["close_t-1"] / p["close_t-6"] - 1.0
+    p["pop_flag"] = (p["ret_5d_lag_pop"] >= 0.10).astype(int)
+    sec_pop = p.groupby(["sector", "date"])["pop_flag"].sum().reset_index()
+    sec_pop.columns = ["sector", "date", "sector_pop_5d"]
+    new_panel = new_panel.merge(sec_pop, on=["sector", "date"], how="left")
+    new_panel["sector_pop_5d"] = new_panel["sector_pop_5d"].fillna(0).astype(int)
+
+    news_rows = []
+    for tk, sub in new_panel.groupby("ticker", sort=False):
+        sub_dates = sub[["date"]].copy()
+        fb_t = fb_full[fb_full["ticker"] == tk][["date", "finbert_max", "finbert_mean", "finbert_n"]]
+        kw_t = cat87.parse_news_keywords(tk)
+        feat = cat87.compute_per_ticker_news_features(sub_dates, fb_t, kw_t)
+        feat["ticker"] = tk
+        news_rows.append(feat)
+    news_feats = pd.concat(news_rows, ignore_index=True)
+    new_panel = new_panel.merge(news_feats, on=["ticker", "date"], how="left")
+
+    # Match training-time imputation (93_train_v3.py): finbert_* -> 0.0, counts/flags -> 0
+    for c in ["finbert_max_5d", "finbert_max_20d", "finbert_mean_5d"]:
+        new_panel[c] = new_panel[c].fillna(0.0)
+    for c in ["news_n_5d", "news_n_20d", "earn_news_5d", "earn_news_20d",
+              "ma_news_5d", "ma_news_20d"]:
+        new_panel[c] = new_panel[c].fillna(0).astype(float)
 
     # XRank features cross-sectional per date
     new_panel["rsi_14_xrank"] = new_panel.groupby("date")["rsi_14"].rank(pct=True)
@@ -244,7 +498,8 @@ def run_fetch_and_features(cache_path):
     # Save features for downstream scoring stage (only last 5 days per ticker — saves disk)
     last_d = new_panel["date"].max()
     keep = new_panel[new_panel["date"] >= (last_d - pd.Timedelta(days=10))].copy()
-    keep.to_csv(cache_path, index=False)
+    _tmp = cache_path.with_suffix(f".tmp{os.getpid()}")
+    keep.to_csv(_tmp, index=False); os.replace(_tmp, cache_path)
     print(f"[101] cached features at {cache_path} ({len(keep):,} rows, last 10d)")
 
 
@@ -272,10 +527,23 @@ def run_score(cache_path):
           f"regime_on = {spy_20d_today > 0}")
     print(f"[101] candidates with full features: {len(today)}")
 
+    # Entry-timing flag (NOT a ranking penalty). Backtest shows the EXTREME
+    # tag (deep drawdown + high vol) has the BEST top-5 hit rate of any tag
+    # (37%, vs 30% FRESH / 24% CATALYST) — see 102_sunday_check.py's
+    # TAG_HITRATE_TOP5 and feedback_extreme_tag_is_best memory. So a still-falling
+    # name is NOT excluded or down-ranked here; the ranking is left as-is.
+    # What this flags instead is entry timing: a name still down 5%+ over 5d
+    # has no confirmed intraday bottom yet, so buying the exact print you see
+    # here risks entering mid-drop ("半山腰"). Wait for a flat/green print
+    # before entering; don't chase a deeper drop.
+    today["entry_note"] = np.where(
+        today["ret_5d_lag"] <= -0.05,
+        "wait for stabilization (down 5%+/5d, no confirmed bottom yet)", "")
+
     print("\n[101] === TOP 15 by raw_margin ===")
     top15 = today.nlargest(15, "raw_margin").copy()
     print(top15[["ticker", "sector", "raw_margin", "prob_cal", "close",
-                  "ret_5d_lag", "ret_20d_lag", "atr_pct", "dd_60d", "run_length"]]
+                  "ret_5d_lag", "ret_20d_lag", "atr_pct", "dd_60d", "run_length", "entry_note"]]
           .to_string(index=False, formatters={
               "raw_margin": "{:+.2f}".format, "prob_cal": "{:.3f}".format,
               "close": "${:.2f}".format, "ret_5d_lag": "{:+.1%}".format,
@@ -286,7 +554,7 @@ def run_score(cache_path):
     print("\n[101] === TOP 5 (Option 1B entries) ===")
     top5 = today.nlargest(5, "raw_margin")[["ticker", "sector", "raw_margin", "prob_cal",
                                               "close", "ret_5d_lag", "ret_20d_lag",
-                                              "atr_pct", "dd_60d", "run_length"]]
+                                              "atr_pct", "dd_60d", "run_length", "entry_note"]]
     print(top5.to_string(index=False, formatters={
         "raw_margin": "{:+.2f}".format, "prob_cal": "{:.3f}".format,
         "close": "${:.2f}".format, "ret_5d_lag": "{:+.1%}".format,
@@ -294,8 +562,20 @@ def run_score(cache_path):
         "dd_60d": "{:.0%}".format, "run_length": "{:.0f}".format,
     }))
 
+    print()
+    print(extension_report(today.nlargest(15, "raw_margin"), k=5))
+    print()
+    print(vol_exposure_report(today, k=5))
+    print()
+    print(extension_indicator(today, k=5))
+
     OUT.mkdir(parents=True, exist_ok=True)
-    today.to_csv(OUT / "today_score_fresh_sp500.csv", index=False)
+    # Atomic: on 2026-09-23 a mid-download crash left a 60-row partial here,
+    # and downstream ranked the day inside it. tmp+replace means the file is
+    # either yesterday's complete score or today's complete score, never a torso.
+    _out = OUT / "today_score_fresh_sp500.csv"
+    _tmp = _out.with_suffix(f".tmp{os.getpid()}")
+    today.to_csv(_tmp, index=False); os.replace(_tmp, _out)
     print(f"\n[101] saved {OUT / 'today_score_fresh_sp500.csv'}")
 
 

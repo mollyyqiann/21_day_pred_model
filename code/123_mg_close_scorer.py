@@ -295,13 +295,32 @@ def load_state():
     return json.loads(STATE.read_text()) if STATE.exists() else {"positions": [], "ever_entered": []}
 
 
-def rescore():
+def rescore(timeout=1800):
     """Refresh the score on the current (near-complete) session."""
-    r = subprocess.run([PY, str(ROOT / "code" / "101_refresh_score_today.py")],
-                       cwd=ROOT, capture_output=True, text=True, timeout=1800)
-    if r.returncode != 0:
-        print(f"[123] WARNING: rescore exited {r.returncode}; using the existing score file")
-    return r.returncode == 0
+    try:
+        r = subprocess.run([PY, str(ROOT / "code" / "101_refresh_score_today.py")],
+                           cwd=ROOT, capture_output=True, text=True, timeout=timeout)
+        rc = r.returncode
+    except subprocess.TimeoutExpired:
+        rc = -1
+        print(f"[123] WARNING: rescore timed out after {timeout}s")
+    if rc != 0:
+        print(f"[123] WARNING: rescore exited {rc}; score file left as-is")
+    return rc == 0
+
+
+def _score_ok(min_rows, today):
+    """Is the score file complete and from today?"""
+    try:
+        g = pd.read_csv(OUT / "today_score_fresh_sp500.csv")
+    except Exception:
+        return False, "unreadable"
+    if len(g) < min_rows:
+        return False, f"{len(g)} rows (< {min_rows}) — partial download"
+    asof = str(g["date"].iloc[0]) if "date" in g.columns and len(g) else "?"
+    if asof != today:
+        return False, f"asof {asof}, not today — stale"
+    return True, f"{len(g)} rows, asof {asof}"
 
 
 def build():
@@ -487,8 +506,32 @@ if __name__ == "__main__":
     if not _cal["tradable"]:
         print(f"[123] WARNING: {_cal['reason']} — running anyway (--force)")
 
+    # Fetch with retries. The 2026-09-23 failure was a mid-run yfinance rate
+    # limit; the right first response is to back off and try again, not to
+    # write off the day. Budget: the plan must exist before the 15:55
+    # executor, so retries stop ~7 minutes after start no matter what, and
+    # each attempt gets a hard per-attempt timeout (the old 1800s timeout
+    # would have blown straight through the execution window).
+    _min_rows = int(os.environ.get("MG_MIN_UNIVERSE") or 400)
+    _today = datetime.now().date().isoformat()
     if not a.skip_rescore:
-        rescore()
+        import time as _time
+        _t0 = _time.time()
+        for _attempt in range(1, 4):
+            _remaining = 420 - (_time.time() - _t0)
+            if _remaining < 60:
+                print("[123] retry budget exhausted")
+                break
+            rescore(timeout=min(300, int(_remaining)))
+            _ok, _why = _score_ok(_min_rows, _today)
+            if _ok:
+                if _attempt > 1:
+                    print(f"[123] rescore recovered on attempt {_attempt} ({_why})")
+                break
+            print(f"[123] attempt {_attempt}: score file not usable ({_why})"
+                  + (" — backing off 45s" if _attempt < 3 else ""))
+            if _attempt < 3:
+                _time.sleep(45)
 
     # DATA GATE -- added 2026-09-23 after the 60-row day. 101 crashed mid-run
     # (yfinance rate limit) and left a PARTIAL score file: 60 of ~501 names,
@@ -500,16 +543,8 @@ if __name__ == "__main__":
     # to happen here, before any counter mutates or any plan is written.
     # Bailing out leaves latest.json on yesterday's date, which the 15:55
     # executor already refuses to trade -- same standdown path as a failed run.
-    _gate = pd.read_csv(OUT / "today_score_fresh_sp500.csv")
-    _rows = len(_gate)
-    _asof = str(_gate["date"].iloc[0]) if "date" in _gate.columns and len(_gate) else "?"
-    _today = datetime.now().date().isoformat()
-    _min_rows = int(os.environ.get("MG_MIN_UNIVERSE") or 400)
-    _bad = None
-    if _rows < _min_rows:
-        _bad = f"score file has {_rows} rows (< {_min_rows}) — partial download"
-    elif _asof != _today and not a.force:
-        _bad = f"score file is asof {_asof}, not today — stale fallback"
+    _ok, _why = _score_ok(_min_rows, _today)
+    _bad = None if _ok else f"score file: {_why} (after retries)"
     if _bad and not a.force:
         msg = f"[123] DATA GATE: {_bad}. No plan written, no counters touched, nothing will trade."
         print(msg)
