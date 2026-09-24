@@ -37,7 +37,15 @@ near the median peak raised total P&L in BOTH model eras; +20% and +30% caps
 were negative in era B. This is about capital turnover, not win rate.
 
 SUPERSEDED FOR LIVE USE (2026-09). The scheduled path is
-123_mg_close_scorer.py (15:45, TAKE_PROFIT 0.30) plus 124_mg_reconcile.py.
+123_mg_close_scorer.py (15:45) plus 124_mg_reconcile.py. The live book has NO
+take profit at all since 2026-09-10 (137_pit_replay.py: no target beat every
+target on return, vol and drawdown; MG_TAKE_PROFIT re-enables a HALF-size one
+-- 136_tp_adjudication.py found size, not level, was what the old +12%-vs-+30%
+argument turned on), a -15% stop, and a 26-day cap since 09-21.
+This file still sells the whole position, and still blocks a name it has ever
+held (`ever_entered`) where 123 now blocks only the 30-day wash-sale window
+after a LOSING exit. It places no orders, so both divergences only affect what
+it prints.
 This file is kept for its v1 rule set and analysis; it now READS
 data/mg_paper_positions.json without writing it, so running it can no longer
 disturb live positions. --confirm / --close still write, deliberately.
@@ -209,6 +217,8 @@ if __name__ == "__main__":
         (pdir / "latest.txt").write_text(txt)
         # DO NOT save_state() here. 123_mg_close_scorer.py and
         # 124_mg_reconcile.py own data/mg_paper_positions.json now, and this
-        # script's rules differ from theirs (TAKE_PROFIT 0.12 vs 0.30). A plain
+        # script's rules differ from theirs (this file keeps the retired
+        # +12% full-exit target; live 123 has NO take profit since 2026-09-10
+        # and a 26-day cap since 09-21). A plain
         # run of this file used to advance days_held under the live strategy's
         # feet, aging real positions toward the 21-day cap. Read-only now.

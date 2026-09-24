@@ -3,11 +3,13 @@
 Goal: get fresh top-5 for the most recent trading day without rebuilding
 the entire panel. Approach:
 
-1. Load existing monthly_gainer_panel.csv (ends 2026-04-30).
-2. yfinance.download SP500 tickers for last ~80 trading days (need lookback
-   for rolling features).
-3. For each ticker, replace last ~70 days of panel with fresh yfinance data
-   (in case anything was off) and append new days.
+1. Load existing monthly_gainer_panel.csv (whatever date it currently ends).
+2. Fetch 260 days of bars per ticker from yfinance -- CHUNKED, 60 tickers per
+   request with a pause between chunks (see fetch_recent; 2026-09-23). 260
+   because ma60_slope_60d first validates at bar 120, and the old 120-bar
+   window meant that feature only ever existed on the final bar. A fetch
+   covering <80% of the universe is a FAILED RUN (exit 1, nothing written).
+3. Recompute all rolling features from the fresh fetch per ticker.
 4. Recompute v8 features (rsi, macd, atr, etc.) for the appended rows.
 5. Refresh SPY + VIX for regime; compute regime features.
 6. Compute xrank cross-sectionally on the latest day.
@@ -134,7 +136,7 @@ def _normalize_ohlcv(df, tk):
 
 
 def fetch_recent(tickers, days=120):
-    """Threaded bulk fetch + sequential retry for tickers that came back empty.
+    """Chunked fetch (60/request + pause) + sequential retry for stragglers.
 
     The threaded yf.download contends on yfinance's SQLite cache (cookies.db,
     tkr-tz.db). On busy runs (esp. ~500 tickers) the cache hits intermittent

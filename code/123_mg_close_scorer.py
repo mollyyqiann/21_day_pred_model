@@ -51,7 +51,8 @@ ENTRY  top-5 by raw_margin, extension indicator FAVOURABLE (0 of 3 flags),
        appearance ever".
 EXIT   NO take profit (2026-09-10; see TAKE_PROFIT). Stop loss -15%, out of
        top-15 for 2 consecutive publication days (minimum 2-day hold), and the
-       21-trading-day cap. A target, if MG_TAKE_PROFIT re-enables one, sells
+       26-trading-day cap (21 until 2026-09-21; see MAX_HOLD_DAYS). A
+       target, if MG_TAKE_PROFIT re-enables one, sells
        half and keeps the slot. TP and SL are checked once daily at 15:45
        against the same-session price and are exempt from the minimum hold.
 SIZE   8 slots, equal weight, fractional (dollar) orders -- regular hours only.
@@ -128,13 +129,13 @@ SLOT_DOLLARS = 125
 # the +12% here was an artifact of a 4-month sample -- see 136 for why that
 # sample was measuring a pick population the strategy cannot even buy.
 #
-# So TAKE_PROFIT is now 0 = DISABLED. Exits are the stop, the 21-day cap and
-# the dropout rule. Set MG_TAKE_PROFIT=0.30 to put a target back; it will sell
+# So TAKE_PROFIT is now 0 = DISABLED. Exits are the stop, the hold cap
+# (26 days since 2026-09-21) and the dropout rule. Set MG_TAKE_PROFIT=0.30 to put a target back; it will sell
 # TAKE_PROFIT_PORTION, which is still the one thing both samples agreed on.
 TAKE_PROFIT = float(os.environ.get("MG_TAKE_PROFIT") or 0)   # 0 = no target
 
 # How much of the position the target sells. 0.5 = sell half, ride the rest to
-# the stop or the 21-day cap; 1.0 restores the old sell-everything behaviour.
+# the stop or the hold cap; 1.0 restores the old sell-everything behaviour.
 #
 # This is the answer to the contradiction above, and it is not a compromise for
 # its own sake. Measured on the 34 first appearances (136_tp_adjudication.py),
