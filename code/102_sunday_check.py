@@ -40,6 +40,7 @@ import subprocess
 import time
 import warnings
 from datetime import datetime
+from importlib import import_module
 from pathlib import Path
 
 import joblib
@@ -63,8 +64,35 @@ OUT = ROOT / "output" / "monthly_gainer"
 
 sys.path.insert(0, str(ROOT / "code"))
 from extension_classifier import attach_extension  # noqa: E402
+cat87 = import_module("87_catalyst_live_features")  # live catalyst-feature helpers
 
-PORTFOLIO = ["INTC", "SMCI", "MRNA"]
+_holdings_path = DATA / "portfolio_holdings.json"
+PORTFOLIO = (list(json.loads(_holdings_path.read_text())["holdings"].keys())
+             if _holdings_path.exists() else [])
+
+# Backtested target-hit rate (+30% within 21 trading days) per extension tag,
+# top-5 picks across the 3-year panel (~3,060 picks). Source: code/199_ext_tag_backtest.py.
+# COUNTERINTUITIVE FINDING: EXTREME is the BEST-performing tag, not the worst.
+# The "extension penalty" intuition (avoid names that have already run) is wrong
+# for this universe — momentum continuation dominates mean reversion.
+TAG_HITRATE_TOP5 = {
+    "EXTREME":  0.370,
+    "COOLED":   0.333,
+    "FRESH":    0.295,
+    "MILD":     0.270,
+    "CATALYST": 0.237,
+    "GRADUAL":  0.10,
+    "VOLATILE": 0.05,
+}
+TAG_AVG21D_TOP5 = {
+    "EXTREME":  0.161,
+    "COOLED":   0.125,
+    "FRESH":    0.137,
+    "MILD":     0.126,
+    "CATALYST": 0.086,
+    "GRADUAL":  0.05,
+    "VOLATILE": 0.0,
+}
 
 
 def _is_market_hours(now=None) -> bool:
@@ -178,13 +206,16 @@ def fetch_recent(tickers, days=120):
                         auto_adjust=True, threads=True, progress=False, group_by="ticker")
     print(f"[102] downloaded in {time.time()-t0:.0f}s")
     rows = []
+    missing = []
     for tk in tickers:
         try:
             df = data[tk] if isinstance(data.columns, pd.MultiIndex) else data
         except Exception:
+            missing.append(tk)
             continue
         df = df.dropna(subset=["Close"])
         if df.empty:
+            missing.append(tk)
             continue
         df = df.reset_index().rename(columns={"Date": "date", "Open": "open",
                                                 "High": "high", "Low": "low",
@@ -192,13 +223,95 @@ def fetch_recent(tickers, days=120):
         df["ticker"] = tk
         df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None).dt.normalize()
         rows.append(df[["date", "ticker", "open", "high", "low", "close", "volume"]])
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+    # Retry pass: parallel individual fetches for tickers the bulk call missed.
+    # yfinance bulk is flaky when the SQLite cache is contended or when Yahoo
+    # rate-limits the cookies. Retry strategy: short sleep to let rate-limit
+    # window clear, then threaded individual fetches (avoid 5+ minute sequential
+    # crawl when hundreds of tickers fail).
+    if missing:
+        n_missing = len(missing)
+        print(f"[102] bulk pull missed {n_missing} tickers, retrying with parallel fetch ...")
+        time.sleep(3)  # give Yahoo's per-cookie rate limiter a moment
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def fetch_one(tk):
+            try:
+                df = yf.Ticker(tk).history(period=f"{days}d", auto_adjust=True)
+                df = df.dropna(subset=["Close"])
+                if df.empty:
+                    return tk, None
+                df = df.reset_index().rename(columns={"Date": "date", "Open": "open",
+                                                        "High": "high", "Low": "low",
+                                                        "Close": "close", "Volume": "volume"})
+                df["ticker"] = tk
+                df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None).dt.normalize()
+                return tk, df[["date", "ticker", "open", "high", "low", "close", "volume"]]
+            except Exception as e:
+                return tk, None
+
+        still_missing = []
+        # Prioritize PORTFOLIO first, then everything else — guarantees holdings
+        # get fetched even if Yahoo rate-limits us part-way through
+        ordered = [t for t in PORTFOLIO if t in missing] + [t for t in missing if t not in PORTFOLIO]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(fetch_one, tk): tk for tk in ordered}
+            for fut in as_completed(futures):
+                tk, df = fut.result()
+                if df is None:
+                    still_missing.append(tk)
+                else:
+                    rows.append(df)
+
+        recovered = n_missing - len(still_missing)
+        print(f"[102] retry recovered {recovered}/{n_missing}; {len(still_missing)} still missing")
+        if still_missing:
+            print(f"[102] WARNING: {len(still_missing)} tickers had no data after retry", file=sys.stderr)
+            port_missing = [tk for tk in still_missing if tk in PORTFOLIO]
+            if port_missing:
+                print(f"[102] CRITICAL: portfolio holdings missing data: {port_missing}", file=sys.stderr)
+
+    # Sanity check: any portfolio ticker missing today's date? Loud warn.
+    if rows:
+        all_df = pd.concat(rows, ignore_index=True)
+        latest = all_df["date"].max()
+        for tk in PORTFOLIO:
+            tk_max = all_df[all_df["ticker"] == tk]["date"].max() if (all_df["ticker"] == tk).any() else None
+            if tk_max is None:
+                print(f"[102] CRITICAL: {tk} missing entirely from panel", file=sys.stderr)
+            elif tk_max < latest:
+                print(f"[102] WARN: {tk} latest date is {tk_max.date()} (panel latest = {latest.date()})", file=sys.stderr)
+        return all_df
+
+    return pd.DataFrame()
+
+
+def _history_with_retry(ticker, period, max_retries=3, retry_delay=20.0):
+    """yfinance .history() with retry-with-backoff.
+
+    2026-09-09: this call had zero retry, unlike the main bulk downloader
+    a few lines up (which already retries missed tickers) -- a single
+    transient YFRateLimitError here crashed the whole post-open recheck
+    with no output and no Telegram send, even though Yahoo's rate limit
+    routinely clears within a minute or two.
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return yf.Ticker(ticker).history(period=period, auto_adjust=True)
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries:
+                print(f"[102] {ticker} fetch failed ({type(e).__name__}: {e}); "
+                      f"retrying in {retry_delay:.0f}s (attempt {attempt+1}/{max_retries}) ...")
+                time.sleep(retry_delay)
+    raise last_exc
 
 
 def fetch_spy_vix(days=400):
     print(f"[102] fetching SPY + VIX ...")
-    spy = yf.Ticker("^GSPC").history(period=f"{days}d", auto_adjust=True)
-    vix = yf.Ticker("^VIX").history(period=f"{days}d", auto_adjust=True)
+    spy = _history_with_retry("^GSPC", f"{days}d")
+    vix = _history_with_retry("^VIX", f"{days}d")
     spy = spy.reset_index().rename(columns={"Date": "date", "Close": "close"})
     spy["date"] = pd.to_datetime(spy["date"]).dt.tz_localize(None).dt.normalize()
     spy = spy[["date", "close"]].sort_values("date").reset_index(drop=True)
@@ -319,10 +432,44 @@ def main():
     regime[REGIME_FEATS] = regime[REGIME_FEATS].ffill()
     new_panel = new_panel.merge(regime[["date"] + REGIME_FEATS], on="date", how="left")
 
-    CATALYST = ["finbert_max_5d", "finbert_max_20d", "finbert_mean_5d",
-                "news_n_5d", "news_n_20d", "earn_news_5d", "earn_news_20d",
-                "ma_news_5d", "ma_news_20d", "sector_pop_5d"]
-    for c in CATALYST: new_panel[c] = 0.0
+    # Live catalyst features (finbert sentiment, news volume, earnings/M&A
+    # keyword flags, sector pop) — reuses the same rolling-window logic as
+    # the offline panel builder (87_catalyst_live_features.py) so live
+    # inference matches how these features were computed at train time.
+    print("[102] computing live catalyst features ...")
+    fb_path = DATA / "finbert_scores.csv"
+    if fb_path.exists():
+        fb_full = pd.read_csv(fb_path, parse_dates=["date"])
+    else:
+        fb_full = pd.DataFrame(columns=["ticker", "date", "finbert_max", "finbert_mean", "finbert_n"])
+
+    p = new_panel[["ticker", "date", "close", "sector"]].sort_values(["ticker", "date"]).copy()
+    p["close_t-1"] = p.groupby("ticker")["close"].shift(1)
+    p["close_t-6"] = p.groupby("ticker")["close"].shift(6)
+    p["ret_5d_lag_pop"] = p["close_t-1"] / p["close_t-6"] - 1.0
+    p["pop_flag"] = (p["ret_5d_lag_pop"] >= 0.10).astype(int)
+    sec_pop = p.groupby(["sector", "date"])["pop_flag"].sum().reset_index()
+    sec_pop.columns = ["sector", "date", "sector_pop_5d"]
+    new_panel = new_panel.merge(sec_pop, on=["sector", "date"], how="left")
+    new_panel["sector_pop_5d"] = new_panel["sector_pop_5d"].fillna(0).astype(int)
+
+    news_rows = []
+    for tk, sub in new_panel.groupby("ticker", sort=False):
+        sub_dates = sub[["date"]].copy()
+        fb_t = fb_full[fb_full["ticker"] == tk][["date", "finbert_max", "finbert_mean", "finbert_n"]]
+        kw_t = cat87.parse_news_keywords(tk)
+        feat = cat87.compute_per_ticker_news_features(sub_dates, fb_t, kw_t)
+        feat["ticker"] = tk
+        news_rows.append(feat)
+    news_feats = pd.concat(news_rows, ignore_index=True)
+    new_panel = new_panel.merge(news_feats, on=["ticker", "date"], how="left")
+
+    # Match training-time imputation (93_train_v3.py): finbert_* -> 0.0, counts/flags -> 0
+    for c in ["finbert_max_5d", "finbert_max_20d", "finbert_mean_5d"]:
+        new_panel[c] = new_panel[c].fillna(0.0)
+    for c in ["news_n_5d", "news_n_20d", "earn_news_5d", "earn_news_20d",
+              "ma_news_5d", "ma_news_20d"]:
+        new_panel[c] = new_panel[c].fillna(0).astype(float)
 
     new_panel["rsi_14_xrank"] = new_panel.groupby("date")["rsi_14"].rank(pct=True)
     new_panel["rv_60_xrank"] = new_panel.groupby("date")["rv_60"].rank(pct=True)
@@ -350,6 +497,17 @@ def main():
     top15 = today.nlargest(15, "raw_margin")
     top15 = attach_extension(top15)
     today_full = attach_extension(today)
+
+    # Dump full ranking with sectors for downstream sector-diversification analysis
+    today_str_csv = datetime.now().strftime("%Y-%m-%d")
+    full_cols = [c for c in
+                 ["ticker", "sector", "close", "prob_cal", "raw_margin",
+                  "ret_5d_lag", "ret_20d_lag", "rsi_14", "ext_level", "ext_priority"]
+                 if c in today_full.columns]
+    today_full.sort_values("raw_margin", ascending=False)[full_cols].to_csv(
+        OUT / f"today_full_{today_str_csv}.csv", index=False
+    )
+
     portfolio_in_top15 = {tk: tk in top15["ticker"].values for tk in PORTFOLIO}
     portfolio_data = today_full[today_full["ticker"].isin(PORTFOLIO)].copy()
     portfolio_data["rank"] = portfolio_data["raw_margin"].rank(method="min", ascending=False).astype(int)
@@ -531,31 +689,47 @@ def build_verdict(last_d, regime_on, spy_20d, futures, news, top5, top15,
         if gate_line:
             lines.append(gate_line)
 
-    # Top 5 today
-    lines += ["", "## Today's top-5 (concentrated picks for small-N portfolio)"]
+    # Top 5 today — with backtested hit rate per tag inline
+    lines += ["", "## Today's top-5 — THE buy list (concentrated picks for small-N portfolio)"]
     for i, (_, r) in enumerate(top5.iterrows(), 1):
         marker = "👤" if r["ticker"] in PORTFOLIO else "  "
         ext_lvl = r.get("ext_level", "")
-        ext_tag = f" [{ext_lvl}]" if ext_lvl else ""
-        lines.append(f"{marker} {i:>2}. {r['ticker']:<5}{ext_tag} ${r['close']:>8.2f}  "
+        hr = TAG_HITRATE_TOP5.get(ext_lvl, 0)
+        hr_str = f" [{ext_lvl} hist {hr:.0%}]" if ext_lvl else ""
+        ret5 = float(r.get("ret_5d_lag", 0))
+        stab = "  ⏳ wait for stabilization (down 5%+/5d)" if ret5 <= -0.05 else ""
+        lines.append(f"{marker} {i:>2}. {r['ticker']:<5}{hr_str} ${r['close']:>8.2f}  "
                       f"margin {r['raw_margin']:+.2f}  prob {r['prob_cal']:.0%}  "
-                      f"5d {r['ret_5d_lag']:+.1%}")
+                      f"5d {r['ret_5d_lag']:+.1%}{stab}")
 
-    # Fresh alternatives — non-EXTREME picks in top-15 with positive margin, excluding portfolio
+    # Per-tag backtest reference (3yr panel, 3,060 top-5 picks)
+    lines += ["", "## Tag historical hit rate (backtested, top-5 picks, 3yr panel)",
+              "EXTREME 37% | COOLED 33% | FRESH 30% | MILD 27% | CATALYST 24%",
+              "Counterintuitive: EXTREME (already-extended momentum) outperforms FRESH.",
+              "Use the model's raw_margin ranking as-is; do NOT apply manual extension penalty."]
+
+    # Alternatives — top-15 non-portfolio, positive margin, sorted by margin × hit rate
     alts = top15[~top15["ticker"].isin(PORTFOLIO)].copy()
-    alts = alts[alts.get("ext_level", pd.Series([""] * len(alts))) != "EXTREME"]
     alts = alts[alts["raw_margin"] > 0]
-    alts = alts.sort_values("raw_margin", ascending=False)
-    lines += ["", "## Fresh alternatives in top-15 (non-EXTREME, positive margin, excl. portfolio)"]
+    alts["hit_rate"] = alts.get("ext_level", "").map(TAG_HITRATE_TOP5).fillna(0.25)
+    alts["edge_score"] = alts["raw_margin"] * alts["hit_rate"]
+    alts = alts.sort_values("edge_score", ascending=False)
+    lines += ["", "## Watch-only — ranks 6-15 (NOT buys)",
+              "_Backtest: names ranked 6-15 touched +30% in 0/5 cases at ~half the conviction "
+              "(raw_margin +0.15 vs +0.38) of the top-5. Monitor these; concentrate capital in "
+              "the top-5 above._"]
     if alts.empty:
-        lines.append("- (none — all non-portfolio non-EXTREME picks in top-15 have negative margin)")
+        lines.append("- (none — no non-portfolio top-15 picks with positive margin)")
     else:
         for _, r in alts.iterrows():
             ext_lvl = r.get("ext_level", "")
-            ext_tag = f"[{ext_lvl}]" if ext_lvl else ""
+            hr = TAG_HITRATE_TOP5.get(ext_lvl, 0)
+            hr_str = f"[{ext_lvl} {hr:.0%}]"
+            ret5 = float(r.get("ret_5d_lag", 0))
+            stab = "  ⏳ wait for stabilization (down 5%+/5d)" if ret5 <= -0.05 else ""
             lines.append(
-                f"- **{r['ticker']}** {ext_tag} ${r['close']:.2f}  margin {r['raw_margin']:+.2f}  "
-                f"prob {r['prob_cal']:.0%}  5d {r['ret_5d_lag']:+.1%}  20d {r.get('ret_20d_lag', 0):+.1%}"
+                f"- **{r['ticker']}** {hr_str} ${r['close']:.2f}  margin {r['raw_margin']:+.2f}  "
+                f"prob {r['prob_cal']:.0%}  5d {r['ret_5d_lag']:+.1%}  20d {r.get('ret_20d_lag', 0):+.1%}{stab}"
             )
 
     # Hold guidance — applies to all positions, not just new entries
@@ -564,7 +738,7 @@ def build_verdict(last_d, regime_on, spy_20d, futures, news, top5, top15,
         "## Hold guidance (Monthly Gainer v3 — distinct from burst model)",
         "- **Minimum hold: 1 week** before evaluating exit. The model's edge is over a multi-week window; bailing in 2-3 days throws away expected return.",
         "- **Full target window: 21 trading days** (~30 calendar days). After this, the +30% touch probability has fully bled out — re-evaluate or exit.",
-        "- **Exit triggers**: (a) +30% touched (target hit, lock in), (b) 21d window expired, (c) name drops out of top-15 on a re-score AND has been held ≥1 week.",
+        "- **Exit triggers (live book, as of 2026-09-21)**: (a) **no take profit** — 137's 31-month replay showed every target loses to none (`MG_TAKE_PROFIT` would re-enable a half-out), (b) **−15% stop loss**, (c) out of the top-15 for **2 consecutive publication days** (after a 2-day min hold), (d) **26-trading-day cap**.",
         "- The 5d return shown above is a feature, not a horizon. The model has already weighed it. Don't day-trade these picks.",
     ]
 
