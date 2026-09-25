@@ -142,7 +142,19 @@ log "=== claude exited rc=$RC ==="
 # A non-zero exit means the session died before it could send its own Telegram,
 # so this is the only notice the user would get.
 if [ "$RC" -ne 0 ]; then
-  alert "executor session failed (rc=$RC). Check output/monthly_gainer/execute.log. Orders may be PARTIALLY placed — verify in Robinhood."
+  # Differentiate "session never started" from "session started then died" --
+  # added 2026-09-24 after an org-level auth outage ("Your organization has
+  # disabled Claude subscription access for Claude Code") killed the session
+  # in 4 seconds, before it could load any tool. The old blanket "orders may
+  # be PARTIALLY placed" is needlessly alarming (and wastes the reader's
+  # attention) when nothing was ever attempted; it stays accurate for a
+  # session that died mid-run, which genuinely can leave a fill unrecorded.
+  if grep -qiE "disabled Claude subscription access|Use an Anthropic API key" "$RUNOUT" 2>/dev/null; then
+    _pending=$("$PY" -c "import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get('sells',[]))+len(d.get('buys',[])))" "$PLAN" 2>/dev/null || echo "?")
+    alert "executor could not even START today (org auth: Claude subscription access disabled). No tools were called -- nothing was placed, nothing to reconcile. Check Claude Code access / API key config. Today's plan: $_pending order(s) pending until this is fixed."
+  else
+    alert "executor session failed (rc=$RC). Check output/monthly_gainer/execute.log. Orders may be PARTIALLY placed — verify in Robinhood."
+  fi
 fi
 
 # POST-RUN AUDIT -- added 2026-09-16 after the 09-14 silent failure. That
